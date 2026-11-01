@@ -41,7 +41,7 @@ jobs:
           - os: windows-latest
             name: windows
             exe: araracraft.exe
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             name: linux
             exe: araracraft
           - os: macos-latest
@@ -86,7 +86,9 @@ jobs:
 
   rpm:
     needs: test
-    runs-on: ubuntu-latest
+    # Linux builds use 24.04 (glibc 2.39) so the binary runs on Fedora 40+ and older distros;
+    # ubuntu-latest links against a glibc newer than most users have.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
