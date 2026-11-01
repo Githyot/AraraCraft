@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AraraCraft app icon: our own hyacinth macaw mascot perched on a pixel grass block.
+"""AraraCraft app icon: HP's ReelHouse hyacinth macaw mascot perched on a pixel grass block.
 
 Writes tools/icon/icon.svg, renders it with the Chromium that Playwright ships, then writes
 assets/icon/icon_{16..1024}.png and icon.ico.
@@ -89,64 +89,79 @@ block.append('<line x1="%.2f" y1="%.2f" x2="%.2f" y2="%.2f" stroke="#1c2a12" str
 block.append('<polyline points="%s" fill="none" stroke="#b9ef8a" stroke-width="3" opacity="0.7"/>'
              % P([top_pt(0, 0.04), top_pt(0.04, 0.04), top_pt(0.96, 0.04)]))
 
-# ---- the macaw (flat, round, friendly) -----------------------------------------------------
-BLUE, BLUE_D, BLUE_DD, BLUE_L, BLUE_LL = "#2c6be0", "#1f50b5", "#173c8c", "#5b9cf5", "#9cc8ff"
-YEL, YEL_D = "#ffd23f", "#f0a92a"
-BEAK, BEAK_L, BEAK_D = "#3a3f4b", "#5d6474", "#22252d"
-OUTLINE = 'stroke="%s" stroke-width="7" stroke-linejoin="round"' % BLUE_DD
+# ---- the macaw: HP's ReelHouse mascot (top hat, medal, sleepy eyes, open beak), waving -------
+BLUE, BLUE_D, BLUE_DD, BLUE_L, BLUE_LL = "#2f6be3", "#2152c2", "#14307a", "#5c95f2", "#8fb9ff"
+YEL, YEL_D = "#ffd23f", "#e0a923"
+BEAK, BEAK_L, BEAK_D = "#454b57", "#6b7282", "#2a2e37"
+GREEN = "#2fa84f"
+OUTLINE = 'stroke="%s" stroke-width="6" stroke-linejoin="round" stroke-linecap="round"' % BLUE_DD
+
+
+def eye(cx, cy):
+    return f"""
+<circle cx="{cx}" cy="{cy}" r="31" fill="{YEL}" {OUTLINE}/>
+<circle cx="{cx}" cy="{cy}" r="22" fill="#ffffff"/>
+<circle cx="{cx}" cy="{cy + 5}" r="12" fill="#151922"/>
+<circle cx="{cx + 4}" cy="{cy + 1}" r="4" fill="#ffffff"/>
+<path d="M{cx - 23} {cy + 1} A 23 23 0 0 1 {cx + 23} {cy + 1} Z" fill="{BLUE}"/>
+<path d="M{cx - 23} {cy + 1} L {cx + 23} {cy + 1}" stroke="{BLUE_DD}" stroke-width="5" stroke-linecap="round"/>
+<path d="M{cx - 16} {cy - 40} Q {cx} {cy - 46}, {cx + 16} {cy - 40}" fill="none" stroke="{BLUE_DD}" stroke-width="5" stroke-linecap="round"/>
+"""
+
 
 bird = f"""
 <g transform="translate(256 272) scale(0.8) translate(-256 -304)">
-<!-- tail: two long feathers draped over the front of the block -->
-<path d="M268 292 C 300 330, 318 380, 312 452 C 300 440, 290 400, 262 300 Z" fill="{BLUE_D}" {OUTLINE}/>
-<path d="M248 292 C 280 340, 286 400, 270 470 C 256 452, 250 400, 236 300 Z" fill="{BLUE}" {OUTLINE}/>
-<path d="M256 330 C 268 370, 270 410, 266 450" fill="none" stroke="{BLUE_L}" stroke-width="5" stroke-linecap="round"/>
-
-<!-- folded wing (left) -->
-<path d="M178 190 C 140 220, 140 280, 186 304 C 196 270, 200 230, 178 190 Z" fill="{BLUE_D}" {OUTLINE}/>
-
-<!-- body and head as one blob -->
-<path d="M256 34 C 330 34, 352 92, 344 140 C 360 180, 358 250, 322 286
-         C 296 308, 216 308, 190 286 C 154 250, 152 180, 168 140 C 160 92, 182 34, 256 34 Z"
-      fill="{BLUE}" {OUTLINE}/>
-<!-- crest -->
-<path d="M232 44 C 222 18, 238 6, 252 14 C 256 0, 280 2, 278 24 C 292 18, 304 30, 290 46 Z"
-      fill="{BLUE}" {OUTLINE}/>
-<!-- belly and a soft top light -->
-<ellipse cx="256" cy="236" rx="60" ry="56" fill="{BLUE_L}"/>
-<path d="M214 248 C 226 268, 286 268, 298 248" fill="none" stroke="{BLUE_LL}" stroke-width="5" stroke-linecap="round" opacity="0.8"/>
-<path d="M196 92 C 204 62, 232 48, 258 48" fill="none" stroke="{BLUE_LL}" stroke-width="9" stroke-linecap="round" opacity="0.7"/>
-
-<!-- raised wing (right), waving -->
-<path d="M330 200 C 360 168, 384 128, 396 84 C 410 96, 414 112, 408 126 C 424 126, 430 144, 418 156
-         C 430 164, 426 184, 408 186 C 392 214, 366 236, 340 244 Z" fill="{BLUE_D}" {OUTLINE}/>
-<path d="M352 214 C 372 196, 390 172, 400 150" fill="none" stroke="{BLUE}" stroke-width="6" stroke-linecap="round"/>
-
-<!-- eyes: yellow bare skin rings, big friendly pupils -->
-<g {OUTLINE}>
-  <circle cx="218" cy="112" r="40" fill="{YEL}"/>
-  <circle cx="294" cy="112" r="40" fill="{YEL}"/>
+<!-- tail -->
+<path d="M292 262 C 330 290, 372 318, 404 344 C 392 356, 378 356, 366 350 C 336 330, 306 306, 284 286 Z" fill="{BLUE_D}" {OUTLINE}/>
+<path d="M300 280 C 330 302, 356 322, 380 340" fill="none" stroke="{BLUE}" stroke-width="6" stroke-linecap="round"/>
+<!-- head tufts -->
+<path d="M214 46 C 204 26, 202 8, 206 -6 C 220 6, 228 24, 230 40 Z" fill="{BLUE}" {OUTLINE}/>
+<path d="M234 38 C 232 18, 236 2, 244 -8 C 254 6, 256 22, 252 36 Z" fill="{BLUE}" {OUTLINE}/>
+<!-- left wing, resting -->
+<path d="M190 212 C 162 236, 152 276, 160 306 C 170 300, 176 300, 182 304 C 186 296, 194 294, 200 296 C 206 268, 206 236, 190 212 Z" fill="{BLUE_D}" {OUTLINE}/>
+<!-- body -->
+<ellipse cx="256" cy="246" rx="80" ry="64" fill="{BLUE}" {OUTLINE}/>
+<ellipse cx="256" cy="258" rx="52" ry="42" fill="{BLUE_L}"/>
+<!-- head -->
+<circle cx="256" cy="124" r="94" fill="{BLUE}" {OUTLINE}/>
+<path d="M190 70 C 204 50, 228 40, 252 38" fill="none" stroke="{BLUE_LL}" stroke-width="8" stroke-linecap="round" opacity="0.6"/>
+<!-- cheeks -->
+<ellipse cx="180" cy="156" rx="15" ry="9" fill="#e98bd0" opacity="0.75"/>
+<ellipse cx="332" cy="156" rx="15" ry="9" fill="#e98bd0" opacity="0.75"/>
+{eye(214, 116)}
+{eye(298, 116)}
+<!-- open mouth with tongue, yellow corners -->
+<path d="M226 178 C 228 222, 284 222, 286 178 Z" fill="#3b1622" {OUTLINE}/>
+<ellipse cx="258" cy="206" rx="18" ry="11" fill="#ff7c9c"/>
+<path d="M222 176 C 224 186, 228 192, 234 196" fill="none" stroke="{YEL}" stroke-width="7" stroke-linecap="round"/>
+<path d="M290 176 C 288 186, 284 192, 278 196" fill="none" stroke="{YEL}" stroke-width="7" stroke-linecap="round"/>
+<!-- beak -->
+<path d="M252 136 C 282 134, 304 150, 300 172 C 296 190, 282 200, 270 206 C 274 194, 272 186, 262 182
+         C 246 178, 226 182, 216 172 C 210 154, 226 138, 252 136 Z" fill="{BEAK}" {OUTLINE}/>
+<path d="M232 152 C 244 146, 260 145, 274 148" fill="none" stroke="{BEAK_L}" stroke-width="6" stroke-linecap="round"/>
+<!-- top hat, tilted -->
+<g transform="rotate(14 300 40)">
+  <ellipse cx="300" cy="44" rx="42" ry="10" fill="#1d2029" {OUTLINE}/>
+  <path d="M278 44 L 280 2 C 290 -2, 312 -2, 322 2 L 324 44 Z" fill="#1d2029" {OUTLINE}/>
+  <rect x="279" y="30" width="44" height="6" fill="{GREEN}"/>
+  <rect x="279" y="36" width="44" height="5" fill="{YEL}"/>
+  <path d="M288 8 L 288 26" stroke="#4a5060" stroke-width="5" stroke-linecap="round"/>
 </g>
-<circle cx="220" cy="112" r="29" fill="#ffffff"/>
-<circle cx="292" cy="112" r="29" fill="#ffffff"/>
-<circle cx="228" cy="118" r="17" fill="#141821"/>
-<circle cx="284" cy="118" r="17" fill="#141821"/>
-<circle cx="234" cy="110" r="6" fill="#ffffff"/>
-<circle cx="290" cy="110" r="6" fill="#ffffff"/>
-
-<!-- beak: a big dark hook with the yellow strip of the lower jaw peeking out on both sides -->
-<path d="M204 186 C 214 226, 298 226, 308 186 C 304 236, 276 246, 256 246 C 236 246, 208 236, 204 186 Z"
-      fill="{BEAK_D}" {OUTLINE}/>
-<path d="M206 190 C 218 222, 294 222, 306 190" fill="none" stroke="{YEL}" stroke-width="10" stroke-linecap="round"/>
-<path d="M256 138 C 288 138, 304 156, 300 180 C 296 202, 278 216, 264 230 C 259 236, 253 236, 248 230
-         C 234 216, 216 202, 212 180 C 208 156, 224 138, 256 138 Z" fill="{BEAK}" {OUTLINE}/>
-<path d="M230 158 C 240 150, 254 148, 266 150" fill="none" stroke="{BEAK_L}" stroke-width="7" stroke-linecap="round"/>
-<path d="M256 196 C 258 208, 258 216, 256 224" fill="none" stroke="{BEAK_D}" stroke-width="4" stroke-linecap="round" opacity="0.7"/>
-
-<!-- feet gripping the block -->
+<!-- medal on a green and yellow ribbon -->
+<path d="M226 214 L 256 270 L 286 214" fill="none" stroke="{GREEN}" stroke-width="14" stroke-linejoin="round"/>
+<path d="M226 214 L 256 270 L 286 214" fill="none" stroke="{YEL}" stroke-width="5" stroke-linejoin="round"/>
+<circle cx="256" cy="278" r="17" fill="{YEL}" stroke="{YEL_D}" stroke-width="5"/>
+<path d="M256 268 L 259 275 L 266 275 L 260 280 L 262 287 L 256 283 L 250 287 L 252 280 L 246 275 L 253 275 Z" fill="#fff3b0"/>
+<!-- raised wing, waving -->
+<path d="M326 214 C 350 190, 372 160, 388 128 C 400 136, 404 148, 400 158 C 414 158, 420 172, 410 182
+         C 420 190, 414 206, 398 206 C 384 226, 362 240, 340 246 Z" fill="{BLUE_D}" {OUTLINE}/>
+<path d="M346 226 C 364 212, 380 194, 392 174" fill="none" stroke="{BLUE}" stroke-width="6" stroke-linecap="round"/>
+<path d="M418 118 C 428 124, 432 134, 432 144" fill="none" stroke="{BLUE_L}" stroke-width="5" stroke-linecap="round"/>
+<path d="M432 104 C 446 114, 452 128, 450 142" fill="none" stroke="{BLUE_L}" stroke-width="5" stroke-linecap="round"/>
+<!-- feet -->
 <g fill="{BEAK}" stroke="{BEAK_D}" stroke-width="4" stroke-linejoin="round">
-  <path d="M220 294 c -4 8, 0 14, 7 14 c 3 -4, 9 -4, 12 0 c 7 0, 10 -7, 6 -14 Z"/>
-  <path d="M267 294 c -4 8, 0 14, 7 14 c 3 -4, 9 -4, 12 0 c 7 0, 10 -7, 6 -14 Z"/>
+  <path d="M220 302 c -4 8, 0 14, 7 14 c 3 -4, 9 -4, 12 0 c 7 0, 10 -7, 6 -14 Z"/>
+  <path d="M267 302 c -4 8, 0 14, 7 14 c 3 -4, 9 -4, 12 0 c 7 0, 10 -7, 6 -14 Z"/>
 </g>
 </g>
 """
