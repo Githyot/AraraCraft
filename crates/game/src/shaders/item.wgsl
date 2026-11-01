@@ -28,6 +28,8 @@ struct Item {
 @group(1) @binding(2) var itex2: texture_2d_array<f32>;
 // Block depth: each block texture's height map (heights.rs, as on the terrain).
 @group(1) @binding(3) var ihmap: texture_2d_array<f32>;
+// And from 4096 on in a third.
+@group(1) @binding(4) var itex3: texture_2d_array<f32>;
 @group(2) @binding(0) var<storage, read> items: array<Item>;
 // The material class of each texture layer (material.rs), for the glints and relief.
 @group(2) @binding(1) var<storage, read> layer_mat: array<u32>;
@@ -198,7 +200,10 @@ fn isample(uv: vec2<f32>, layer: i32) -> vec4<f32> {
     if (layer < 2048) {
         return textureSampleLevel(itex, isamp, uv, layer, 0.0);
     }
-    return textureSampleLevel(itex2, isamp, uv, layer - 2048, 0.0);
+    if (layer < 4096) {
+        return textureSampleLevel(itex2, isamp, uv, layer - 2048, 0.0);
+    }
+    return textureSampleLevel(itex3, isamp, uv, layer - 4096, 0.0);
 }
 
 // How much of the sky light reaches a block part's face: the terrain's sun shadows

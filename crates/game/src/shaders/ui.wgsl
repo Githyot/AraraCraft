@@ -8,6 +8,8 @@ struct Screen {
 @group(1) @binding(3) var gui: texture_2d<f32>;
 // Layers from 2048 on live in a second array (renderer::LAYERS_PER_ARRAY).
 @group(1) @binding(4) var blocks2: texture_2d_array<f32>;
+// And from 4096 on in a third.
+@group(1) @binding(5) var blocks3: texture_2d_array<f32>;
 
 struct UOut {
     @builtin(position) clip: vec4<f32>,
@@ -48,8 +50,10 @@ fn fs_ui(in: UOut) -> @location(0) vec4<f32> {
     var c: vec4<f32>;
     if (in.layer < 2048) {
         c = textureSampleLevel(blocks, samp, in.uv, in.layer, 0.0) * in.color;
-    } else {
+    } else if (in.layer < 4096) {
         c = textureSampleLevel(blocks2, samp, in.uv, in.layer - 2048, 0.0) * in.color;
+    } else {
+        c = textureSampleLevel(blocks3, samp, in.uv, in.layer - 4096, 0.0) * in.color;
     }
     if (c.a < 0.1) {
         discard;
