@@ -1,7 +1,7 @@
 # Licences of the game's assets
 
 The **code** (everything under `crates/`, `tools/`, `packaging/`, `plugins-exemplos/`,
-`shaderpacks-examples/` and the build files) is licensed under either of
+`shaderpacks-examples/` and the build files, except `tools/icon/`) is licensed under either of
 [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.
 
 The **assets** are licensed per folder:
