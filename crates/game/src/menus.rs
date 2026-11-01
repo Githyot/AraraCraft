@@ -1,0 +1,759 @@
+//! Title screen and the menus around it: world list, new world, multiplayer, options and
+//! texture packs. The last played world loads behind the title as a slowly turning panorama.
+
+use std::sync::Arc;
+
+use glam::Vec3;
+use voxel::mesh::MeshTables;
+use voxel::save::WorldSave;
+use voxel::worldgen::{Biome, Generator};
+
+use crate::audio::Sfx;
+use crate::ui::{GRAY, WHITE, YELLOW};
+use crate::world::World;
+use crate::{level_path_hint, paintings, textures, Game, Screen};
+
+pub struct WorldEntry {
+    pub name: String,
+    pub survival: bool,
+    pub seed: u64,
+    /// Seconds since the epoch the world was last saved.
+    pub modified: u64,
+    /// Backups of it (worlds.rs).
+    pub backups: Vec<crate::worlds::Backup>,
+    /// A deleted world that can still come back (its copy among the backups).
+    pub deleted: Option<crate::worlds::Backup>,
+}
+
+#[derive(Default)]
+pub struct NewWorldForm {
+    pub name: String,
+    pub seed: String,
+    pub survival: bool,
+    /// World difficulty (tr_modes.rs): 0 Normal, 1 Especialista, 2 Mestre.
+    pub mode: u8,
+    /// The test world with everything of the game set out (testworld.rs).
+    pub test: bool,
+    /// 0 = name field, 1 = seed field.
+    pub field: usize,
+    /// Renaming this world instead of creating one (only the name field shows).
+    pub rename: Option<String>,
+    /// "Apagar" was clicked once for this world at this time: a second click soon deletes it.
+    pub delete_armed: Option<(String, f32)>,
+    /// A line under the world list (what the last button did) and when it was set.
+    pub status: Option<(String, f32)>,
+}
+
+/// Saved worlds, most recently played first.
+pub fn list_worlds(base: &std::path::Path) -> Vec<WorldEntry> {
+    let mut v = Vec::new();
+    let Ok(rd) = std::fs::read_dir(base.join("saves")) else { return v };
+    for e in rd.flatten() {
+        let dir = e.path();
+        let save = WorldSave::new(dir.clone());
+        let Some(level) = save.load_level() else { continue };
+        let modified = std::fs::metadata(dir.join("level.ron"))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let backups = crate::worlds::list(base, &name).into_iter().filter(|b| !b.deleted).collect();
+        v.push(WorldEntry { name, survival: level.survival, seed: level.seed, modified, backups, deleted: None });
+    }
+    v.sort_by_key(|w| std::cmp::Reverse(w.modified));
+    // Deleted worlds that can still come back, at the end.
+    for (name, b) in crate::worlds::deleted(base) {
+        let save = WorldSave::new(b.path.clone());
+        let Some(level) = save.load_level() else { continue };
+        let modified = std::fs::metadata(b.path.join("level.ron")).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+        v.push(WorldEntry { name, survival: level.survival, seed: level.seed, modified, backups: Vec::new(), deleted: Some(b) });
+    }
+    v
+}
+
+/// Text seeds become numbers the same way every time.
+fn parse_seed(text: &str) -> Option<u64> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Ok(n) = t.parse::<i64>() {
+        return Some(n as u64);
+    }
+    // FNV-1a over the text.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in t.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    Some(h)
+}
+
+fn ago(secs: u64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let d = now.saturating_sub(secs);
+    match d {
+        0..=119 => "agora há pouco".into(),
+        120..=7199 => format!("há {} min", d / 60),
+        7200..=172_799 => format!("há {} h", d / 3600),
+        _ => format!("há {} dias", d / 86400),
+    }
+}
+
+impl Game {
+    /// Close the current world (saving it) and open another one, by folder name.
+    pub(crate) fn open_world(&mut self, name: &str, seed: Option<u64>, survival: Option<bool>) {
+        if self.world_open {
+            self.save_all();
+        }
+        self.world_open = false;
+        let save = Arc::new(WorldSave::new(level_path_hint(&self.base, name)));
+        // A test world is laid out again from what the game has now, every time.
+        self.testw = Default::default();
+        if save.dir.join(crate::testworld::MARKER).exists() {
+            let _ = std::fs::remove_dir_all(save.dir.join("chunks"));
+            self.plan_test_world();
+        }
+        let level = save.load_level();
+        let seed = level.as_ref().map(|l| l.seed).or(seed).unwrap_or_else(|| {
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)
+        });
+        self.terrain = self.settings.terrain_override.or(level.as_ref().map(|l| l.terrain)).unwrap_or(voxel::worldgen::TERRAIN);
+        let gen = Arc::new(Generator::new(seed, &self.reg).with_structures(self.structures.clone()).with_spread(self.settings.structure_spread()).with_terrain(self.terrain).with_showcase(self.testw.layout.clone()));
+        let tints: Vec<[f32; 3]> = (0..Biome::COUNT).map(|b| Biome::from_u8(b as u8).tint()).collect();
+        let tables = Arc::new(MeshTables::new(&self.reg, tints));
+        // Dropping the old world stops its worker threads.
+        self.world = World::new(self.reg.clone(), gen.clone(), save.clone(), tables);
+        self.lod.set_gen(gen.clone());
+        self.dim = voxel::worldgen::Dim::Overworld;
+        self.arrival = None;
+        self.respawn_home = false;
+        self.portal_t = 0.0;
+        self.fluids = crate::fluids::Fluids::new(&self.reg);
+        self.redstone = crate::redstone::Redstone::new(self.reg.clone());
+        self.riding = None;
+        self.seat = None;
+        self.sleep = None;
+        self.tnt.clear();
+        if let Some(r) = self.renderer.get_mut() {
+            r.clear_chunks();
+        }
+        self.world_name = name.to_string();
+        self.seed = seed;
+        let (sx, sy, sz) = gen.find_spawn();
+        // The spawn the world was made with, once it has one (a newer generator would move it).
+        let (sx, sz) = level.as_ref().and_then(|l| l.world_spawn).map_or((sx, sz), |[x, z]| (x, z));
+        self.spawn_xz = (sx, sz);
+        self.body = voxel::physics::Body::new(Vec3::new(sx as f32 + 0.5, sy as f32, sz as f32 + 0.5));
+        // The test world's rows run south from the spawn: face them.
+        self.yaw = if self.testw.on { std::f32::consts::PI } else { 0.0 };
+        self.pitch = 0.0;
+        self.time_of_day = 1000.0;
+        self.weather = crate::weather::Weather::new(crate::weather::WeatherSave::default(), seed);
+        self.needs_spawn = true;
+        self.survival = survival.unwrap_or(false);
+        self.health = 20.0;
+        self.air = 10.0;
+        self.hurt_age = 100.0;
+        self.mining = None;
+        self.mobs.list.clear();
+        self.target = None;
+        // What belongs to the world itself: life and mana crystals, bosses beaten, town folk.
+        self.max_health = level.as_ref().map(|l| l.max_health.clamp(20.0, 50.0)).unwrap_or(20.0);
+        self.magic.max_mana = level.as_ref().map(|l| l.max_mana).unwrap_or(20.0);
+        self.boss = crate::bosses::BossState::new(level.as_ref().map(|l| l.bosses.clone()).unwrap_or_default());
+        self.town = crate::npcs::Town::new(level.as_ref().map(|l| l.npcs.iter().map(|(n, h)| crate::npcs::NpcSave { name: n.clone(), home: *h }).collect()).unwrap_or_default());
+        self.t5 = crate::terraria::Terraria::default();
+        self.elements = Default::default();
+        if let Some(l) = &level {
+            self.body.pos = Vec3::from(l.player_pos);
+            self.body.flying = l.flying;
+            self.yaw = l.player_yaw;
+            self.pitch = l.player_pitch;
+            self.time_of_day = l.time_of_day;
+            self.weather = crate::weather::Weather::new(crate::weather::WeatherSave { raining: l.raining, thunder: l.thunder, timer: l.weather_timer }, l.seed);
+            if l.hotbar.len() == 9 {
+                for (i, n) in l.hotbar.iter().enumerate() {
+                    self.hotbar[i] = self.reg.id_or_air(n);
+                }
+            }
+            self.survival = l.survival;
+            self.health = if l.health > 0.0 { l.health.min(self.max_health) } else { self.max_health };
+            self.needs_spawn = false;
+        }
+        if self.survival {
+            self.body.flying = false;
+        }
+        self.fall_peak = self.body.pos.y;
+        self.paintings = paintings::load(&save.dir, &self.painting_defs);
+        self.surv = crate::survival::Survival::load(&save.dir, &self.items);
+        self.prog = crate::progression::Prog::load(&save.dir);
+        self.extras.load(&save.dir, &crate::level_path_hint(&self.base, &self.world_name));
+        let dim = level.as_ref().map(|l| voxel::worldgen::Dim::from_u8(l.dim)).unwrap_or_default();
+        if dim != voxel::worldgen::Dim::Overworld {
+            self.load_dim(dim, false);
+        }
+        self.title_world = name.to_string();
+        self.load_mods();
+    }
+
+    /// Enter the world that is loaded behind the menus (or open a different one first).
+    pub(crate) fn play_world(&mut self, name: &str) {
+        // A copy of the world as it was saved, before playing on (the 3 newest are kept).
+        crate::worlds::backup_later(&self.base, name);
+        if name != self.title_world {
+            self.open_world(name, None, None);
+        }
+        self.world_open = true;
+        self.loaded_frames = 0;
+        self.set_screen(Screen::Loading);
+    }
+
+    /// Camera for the title panorama: hovering over the spawn, slowly turning.
+    pub(crate) fn update_title(&mut self, dt: f32) {
+        self.title_spin += dt * 0.035;
+        if self.needs_spawn {
+            let (sx, sz) = self.spawn_xz;
+            if let Some(y) = self.world.surface_y(sx, sz) {
+                self.body.pos = Vec3::new(sx as f32 + 0.5, y as f32 + 4.0, sz as f32 + 0.5);
+                self.needs_spawn = false;
+            }
+        }
+        self.yaw = self.title_spin;
+        self.pitch = -0.12;
+    }
+
+    pub(crate) fn is_title_screen(&self) -> bool {
+        matches!(self.screen, Screen::Title | Screen::Worlds | Screen::CreateWorld | Screen::Multiplayer)
+            || (!self.world_open && matches!(self.screen, Screen::Options | Screen::Packs | Screen::Keys | Screen::Voice))
+    }
+
+    fn click_sound(&mut self) {
+        self.sfx(Sfx::Click);
+    }
+
+    /// Big blocky title with a shadow.
+    fn draw_logo(&mut self, w: f32, y: f32) {
+        let s = self.ui.scale;
+        let title = "ARARACRAFT";
+        let big = (s * 4.0).max(4.0);
+        let tw = self.ui.text_width(title, big);
+        let x = w / 2.0 - tw / 2.0;
+        self.ui.text_scaled(x + big * 0.6, y + big * 0.6, title, [30, 30, 30, 255], big);
+        self.ui.text_scaled(x, y, title, [200, 200, 200, 255], big);
+        // Splash line, gently pulsing.
+        let pulse = 1.0 + (self.now * 5.0).sin().abs() * 0.08;
+        let msg = "Feito em Rust!";
+        let ms = s * pulse;
+        let mw = self.ui.text_width(msg, ms);
+        self.ui.text_scaled(x + tw - mw * 0.7, y + big * 8.5, msg, YELLOW, ms);
+    }
+
+    pub(crate) fn draw_title_menus(&mut self, w: f32, h: f32, mouse: (f32, f32)) {
+        // Until the panorama is ready, plain dirt-brown; then a light veil over the world.
+        let ready = self.world.meshed_count > 20;
+        self.ui.rect(0.0, 0.0, w, h, if ready { [0, 0, 0, 70] } else { [44, 34, 26, 255] });
+        match self.screen {
+            Screen::Title => self.draw_title(w, h, mouse),
+            Screen::Worlds => self.draw_worlds(w, h, mouse),
+            Screen::CreateWorld => self.draw_create(w, h, mouse),
+            Screen::Multiplayer => self.draw_multiplayer_menu(w, h, mouse),
+            _ => {}
+        }
+    }
+
+    fn draw_title(&mut self, w: f32, h: f32, mouse: (f32, f32)) {
+        let s = self.ui.scale;
+        let logo_y = (h * 0.16).max(10.0 * s);
+        self.draw_logo(w, logo_y);
+        let bw = 200.0 * s;
+        let bh = 20.0 * s;
+        let x = (w - bw) / 2.0;
+        let mut y = (h * 0.42).max(logo_y + 60.0 * s);
+        let items = ["Um jogador", "Multijogador", "Pacotes de textura"];
+        let mut hit = None;
+        for (i, l) in items.iter().enumerate() {
+            if self.ui.button(x, y, bw, bh, l, mouse) && self.clicked {
+                hit = Some(i);
+            }
+            y += bh + 4.0 * s;
+        }
+        y += 8.0 * s;
+        let half = (bw - 4.0 * s) / 2.0;
+        if self.ui.button(x, y, half, bh, "Opções...", mouse) && self.clicked {
+            hit = Some(10);
+        }
+        if self.ui.button(x + half + 4.0 * s, y, half, bh, "Sair do jogo", mouse) && self.clicked {
+            hit = Some(11);
+        }
+        let hs = (s / 2.0).floor().max(1.0);
+        self.ui.text_scaled(2.0 * s, h - 10.0 * hs, &format!("AraraCraft {}", env!("CARGO_PKG_VERSION")), WHITE, hs);
+        let note = "Projeto independente. Não é um produto da Mojang.";
+        let nw = self.ui.text_width(note, hs);
+        self.ui.text_scaled(w - nw - 2.0 * s, h - 10.0 * hs, note, WHITE, hs);
+        if let Some(i) = hit {
+            self.click_sound();
+            match i {
+                0 => {
+                    self.worlds = list_worlds(&self.base);
+                    self.world_sel = if self.worlds.is_empty() { None } else { Some(0) };
+                    self.set_screen(Screen::Worlds);
+                }
+                1 => self.set_screen(Screen::Multiplayer),
+                2 => {
+                    self.packs = textures::list_resource_packs(&self.base.join("resourcepacks"));
+                    self.set_screen(Screen::Packs);
+                }
+                10 => self.open_options(),
+                _ => {
+                    self.settings.save(&self.base.join("settings.ron"));
+                    std::process::exit(0);
+                }
+            }
+        }
+    }
+
+    fn draw_worlds(&mut self, w: f32, h: f32, mouse: (f32, f32)) {
+        let s = self.ui.scale;
+        self.ui.text_centered(w / 2.0, 10.0 * s, "Escolha o mundo", WHITE);
+        let lw = (260.0 * s).min(w - 20.0 * s);
+        let x = (w - lw) / 2.0;
+        let row = 26.0 * s;
+        let top = 24.0 * s;
+        let bottom = h - 80.0 * s;
+        let rows = (((bottom - top) / row).floor() as usize).max(1);
+        self.ui.rect(0.0, top - 2.0 * s, w, bottom - top + 4.0 * s, [0, 0, 0, 120]);
+        if self.worlds.is_empty() {
+            self.ui.text_centered(w / 2.0, top + 20.0 * s, "Nenhum mundo ainda. Crie um novo!", GRAY);
+        }
+        let mut clicked_row = None;
+        for (i, wd) in self.worlds.iter().enumerate().take(rows) {
+            let y = top + i as f32 * row;
+            let hover = mouse.0 >= x && mouse.0 < x + lw && mouse.1 >= y && mouse.1 < y + row - 2.0 * s;
+            if self.world_sel == Some(i) {
+                self.ui.frame(x, y, lw, row - 2.0 * s, s, [255, 255, 255, 255]);
+            } else if hover {
+                self.ui.frame(x, y, lw, row - 2.0 * s, s, [128, 128, 128, 255]);
+            }
+            let gone = wd.deleted.is_some();
+            self.ui.text(x + 4.0 * s, y + 3.0 * s, &wd.name, if gone { GRAY } else { WHITE });
+            let mode = if wd.survival { "Sobrevivência" } else { "Criativo" };
+            let info = if gone {
+                format!("apagado · {mode} · semente {} · jogado {}", wd.seed as i64, ago(wd.modified))
+            } else if wd.backups.is_empty() {
+                format!("{mode} · semente {} · {}", wd.seed as i64, ago(wd.modified))
+            } else {
+                format!("{mode} · semente {} · {} · {} backup{}", wd.seed as i64, ago(wd.modified), wd.backups.len(), if wd.backups.len() == 1 { "" } else { "s" })
+            };
+            let hs = (s / 2.0).floor().max(1.0);
+            self.ui.text_scaled(x + 4.0 * s, y + 13.0 * s, &info, GRAY, hs);
+            if hover && self.clicked {
+                clicked_row = Some(i);
+            }
+        }
+        if let Some(i) = clicked_row {
+            // A second click on the selected world opens it.
+            if self.world_sel == Some(i) && self.worlds[i].deleted.is_none() {
+                let name = self.worlds[i].name.clone();
+                self.click_sound();
+                self.play_world(&name);
+                return;
+            }
+            self.world_sel = Some(i);
+        }
+        let bw = 150.0 * s;
+        let bh = 20.0 * s;
+        let y1 = h - 50.0 * s;
+        let y2 = y1 + bh + 4.0 * s;
+        let y0 = y1 - bh - 4.0 * s;
+        let x1 = w / 2.0 - bw - 2.0 * s;
+        let x2 = w / 2.0 + 2.0 * s;
+        let sel = self.world_sel.filter(|&i| i < self.worlds.len());
+        let gone = sel.is_some_and(|i| self.worlds[i].deleted.is_some());
+        let can_play = sel.is_some() && !gone;
+        let mut hit = None;
+        if let Some((msg, at)) = &self.new_world.status {
+            if self.now - at < 6.0 {
+                let hs = (s / 2.0).floor().max(1.0);
+                let tw = self.ui.text_width(msg, hs);
+                self.ui.text_scaled(w / 2.0 - tw / 2.0, y0 - 9.0 * s, msg, YELLOW, hs);
+            }
+        }
+        // Keeping worlds safe: rename, copy, bring a backup back, delete (two clicks).
+        let total = bw * 2.0 + 4.0 * s;
+        let small = (total - 3.0 * 4.0 * s) / 4.0;
+        let armed = sel.is_some_and(|i| self.new_world.delete_armed.as_ref().is_some_and(|(n, t)| *n == self.worlds[i].name && self.now - t < 4.0));
+        let backups = sel.map(|i| self.worlds[i].backups.len()).unwrap_or(0);
+        let labels: [String; 4] = if gone {
+            ["Recuperar".into(), "-".into(), "-".into(), "-".into()]
+        } else {
+            [
+                "Renomear".into(),
+                "Duplicar".into(),
+                if backups > 0 { format!("Abrir backup ({backups})") } else { "Sem backup".into() },
+                if armed { "Confirmar?".into() } else { "Apagar".into() },
+            ]
+        };
+        for (k, label) in labels.iter().enumerate() {
+            let bx = x1 + k as f32 * (small + 4.0 * s);
+            if self.ui.button_text(bx, y0, small, bh, label, mouse, (s * 0.75).max(1.0)) && self.clicked && sel.is_some() && label != "-" {
+                hit = Some(10 + k);
+            }
+        }
+        if self.ui.button(x1, y1, bw, bh, if can_play { "Jogar mundo selecionado" } else { "(escolha um mundo)" }, mouse) && self.clicked && can_play {
+            hit = Some(0);
+        }
+        if self.ui.button(x2, y1, bw, bh, "Criar novo mundo", mouse) && self.clicked {
+            hit = Some(1);
+        }
+        if self.ui.button(x1, y2, bw * 2.0 + 4.0 * s, bh, "Voltar", mouse) && self.clicked {
+            hit = Some(2);
+        }
+        if let Some(i) = hit {
+            self.click_sound();
+            match i {
+                0 => {
+                    let name = self.worlds[self.world_sel.unwrap()].name.clone();
+                    self.play_world(&name);
+                }
+                10..=13 => self.world_op(i - 10),
+                1 => {
+                    let mut n = 1;
+                    while self.worlds.iter().any(|w| w.name == format!("Mundo {n}")) {
+                        n += 1;
+                    }
+                    self.new_world = NewWorldForm { name: format!("Mundo {n}"), survival: true, ..Default::default() };
+                    self.set_screen(Screen::CreateWorld);
+                }
+                _ => self.set_screen(Screen::Title),
+            }
+        }
+    }
+
+    fn draw_create(&mut self, w: f32, h: f32, mouse: (f32, f32)) {
+        let s = self.ui.scale;
+        let fw = 200.0 * s;
+        let fh = 20.0 * s;
+        let x = (w - fw) / 2.0;
+        let mut y = (h / 2.0 - 80.0 * s).max(20.0 * s);
+        let renaming = self.new_world.rename.is_some();
+        self.ui.text_centered(w / 2.0, y - 14.0 * s, if renaming { "Renomear mundo" } else { "Criar novo mundo" }, WHITE);
+        let caret = if (self.now * 2.0) as i32 % 2 == 0 { "_" } else { "" };
+        let mut hit = None;
+        if renaming {
+            self.new_world.field = 0;
+        }
+        for f in 0..if renaming { 1 } else { 2 } {
+            let (label, value) = if f == 0 { ("Nome do mundo", self.new_world.name.clone()) } else { ("Semente (vazio = aleatória)", self.new_world.seed.clone()) };
+            self.ui.text(x, y, label, GRAY);
+            y += 10.0 * s;
+            let hover = mouse.0 >= x && mouse.0 < x + fw && mouse.1 >= y && mouse.1 < y + fh;
+            self.ui.rect(x, y, fw, fh, [0, 0, 0, 255]);
+            let border = if self.new_world.field == f { [255, 255, 255, 255] } else { [160, 160, 160, 255] };
+            self.ui.frame(x, y, fw, fh, s, border);
+            let shown = if self.new_world.field == f { format!("{value}{caret}") } else { value };
+            self.ui.text(x + 4.0 * s, y + 6.0 * s, &shown, WHITE);
+            if hover && self.clicked {
+                self.new_world.field = f;
+            }
+            y += fh + 8.0 * s;
+        }
+        let kind = format!("Tipo de mundo: {}", if self.new_world.test { "Mundo de teste" } else { "Normal" });
+        if renaming {
+            let half = (fw - 4.0 * s) / 2.0;
+            if self.ui.button(x, y, half, fh, "Renomear", mouse) && self.clicked {
+                self.click_sound();
+                self.create_world();
+            } else if self.ui.button(x + half + 4.0 * s, y, half, fh, "Cancelar", mouse) && self.clicked {
+                self.click_sound();
+                self.new_world.rename = None;
+                self.set_screen(Screen::Worlds);
+            }
+            return;
+        }
+        if self.ui.button(x, y, fw, fh, &kind, mouse) && self.clicked {
+            hit = Some(4);
+        }
+        y += fh + 2.0 * s;
+        if !self.new_world.test {
+            let mode = format!("Modo de jogo: {}", if self.new_world.survival { "Sobrevivência" } else { "Criativo" });
+            if self.ui.button(x, y, fw, fh, &mode, mouse) && self.clicked {
+                hit = Some(0);
+            }
+            y += fh + 2.0 * s;
+        }
+        let diff = format!("Dificuldade: {}", crate::tr_modes::MODE_NAMES[self.new_world.mode.min(2) as usize]);
+        if self.ui.button(x, y, fw, fh, &diff, mouse) && self.clicked {
+            hit = Some(3);
+        }
+        y += fh + 2.0 * s;
+        let hint = if self.new_world.test {
+            "Plano e criativo: todos os blocos, itens, mobs e construções."
+        } else if self.new_world.survival { "Vida, fome de aventura e monstros à noite." } else { "Voe, todos os blocos, sem dano." };
+        let hs = (s / 2.0).floor().max(1.0);
+        let tw = self.ui.text_width(hint, hs);
+        self.ui.text_scaled(w / 2.0 - tw / 2.0, y, hint, GRAY, hs);
+        y += 14.0 * s;
+        let half = (fw - 4.0 * s) / 2.0;
+        if self.ui.button(x, y, half, fh, "Criar mundo", mouse) && self.clicked {
+            hit = Some(1);
+        }
+        if self.ui.button(x + half + 4.0 * s, y, half, fh, "Cancelar", mouse) && self.clicked {
+            hit = Some(2);
+        }
+        if let Some(i) = hit {
+            self.click_sound();
+            match i {
+                0 => self.new_world.survival = !self.new_world.survival,
+                3 => self.new_world.mode = (self.new_world.mode + 1) % 3,
+                4 => self.new_world.test = !self.new_world.test,
+                1 => self.create_world(),
+                _ => self.set_screen(Screen::Worlds),
+            }
+        }
+    }
+
+    pub(crate) fn create_world(&mut self) {
+        if let Some(old) = self.new_world.rename.take() {
+            self.release_world(&old);
+            let msg = match crate::worlds::rename(&self.base, &old, &self.new_world.name) {
+                Ok(n) => format!("\"{old}\" agora se chama \"{n}\""),
+                Err(e) => format!("Não deu para renomear: {e}"),
+            };
+            self.world_list_changed(msg);
+            self.set_screen(Screen::Worlds);
+            return;
+        }
+        let mut name: String = self.new_world.name.trim().chars().filter(|c| !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')).collect();
+        if name.is_empty() {
+            name = "Novo mundo".into();
+        }
+        // Never overwrite an existing world: add a number.
+        let mut final_name = name.clone();
+        let mut n = 2;
+        while level_path_hint(&self.base, &final_name).join("level.ron").exists() {
+            final_name = format!("{name} ({n})");
+            n += 1;
+        }
+        if self.new_world.mode > 0 {
+            // The Terraria side reads it on the first frame in the world (tr.rs).
+            let dir = level_path_hint(&self.base, &final_name);
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join("tr.ron"), format!("(mode: {})", self.new_world.mode));
+        }
+        if self.new_world.test {
+            let dir = level_path_hint(&self.base, &final_name);
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join(crate::testworld::MARKER), "()");
+        }
+        // Secret seeds ("for the worthy"...) turn on a special world (tr3_world.rs).
+        if let Some(special) = crate::tr3_world::special_seed(&self.new_world.seed) {
+            let dir = level_path_hint(&self.base, &final_name);
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join("tr3.ron"), format!("(world: (special: \"{special}\"))"));
+        }
+        let seed = parse_seed(&self.new_world.seed);
+        let survival = self.new_world.survival && !self.new_world.test;
+        self.open_world(&final_name, seed, Some(survival));
+        self.world_open = true;
+        self.loaded_frames = 0;
+        self.set_screen(Screen::Loading);
+    }
+
+    /// Typing into the new-world form.
+    pub(crate) fn type_text(&mut self, text: &str) {
+        if self.net_text(text) {
+            return;
+        }
+        self.creative_type(text);
+        if self.screen == Screen::Sign && self.extras.book.is_some() {
+            self.book_type(text);
+            return;
+        }
+        if self.screen == Screen::Sign && self.cmdblocks.edit.is_some() {
+            self.cmdblock_type(text);
+            return;
+        }
+        if self.screen == Screen::Sign {
+            self.naming_type(text);
+            self.sign_type(text);
+            return;
+        }
+        if self.screen != Screen::CreateWorld {
+            return;
+        }
+        let f = if self.new_world.field == 0 || self.new_world.rename.is_some() { &mut self.new_world.name } else { &mut self.new_world.seed };
+        for c in text.chars() {
+            if !c.is_control() && f.chars().count() < 32 {
+                f.push(c);
+            }
+        }
+    }
+
+    pub(crate) fn form_key(&mut self, code: winit::keyboard::KeyCode) {
+        use winit::keyboard::KeyCode;
+        match code {
+            KeyCode::Backspace => {
+                let f = if self.new_world.field == 0 { &mut self.new_world.name } else { &mut self.new_world.seed };
+                f.pop();
+            }
+            KeyCode::Tab if self.new_world.rename.is_none() => self.new_world.field = 1 - self.new_world.field,
+            KeyCode::Enter | KeyCode::NumpadEnter => self.create_world(),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn draw_packs(&mut self, w: f32, h: f32, mouse: (f32, f32)) {
+        let s = self.ui.scale;
+        self.ui.text_centered(w / 2.0, 10.0 * s, "Pacotes de textura", WHITE);
+        let folder = self.base.join("resourcepacks").display().to_string();
+        let hs = (s / 2.0).floor().max(1.0);
+        let tw = self.ui.text_width(&folder, hs);
+        self.ui.text_scaled(w / 2.0 - tw / 2.0, 21.0 * s, &folder, GRAY, hs);
+        let bw = 220.0 * s;
+        let bh = 18.0 * s;
+        let x = (w - bw) / 2.0;
+        let mut y = 32.0 * s;
+        let current = self.settings.resource_packs.first().cloned();
+        let mut entries: Vec<Option<String>> = vec![None];
+        entries.extend(self.packs.iter().cloned().map(Some));
+        let max_rows = (((h - y - 40.0 * s) / (bh + 2.0 * s)).floor() as usize).max(1);
+        let mut pick = None;
+        for e in entries.iter().take(max_rows) {
+            let name = e.clone().unwrap_or_else(|| "Padrão (do jogo)".into());
+            let label = if *e == current { format!("> {name} <") } else { name };
+            if self.ui.button(x, y, bw, bh, &label, mouse) && self.clicked {
+                pick = Some(e.clone());
+            }
+            y += bh + 2.0 * s;
+        }
+        if self.packs.is_empty() {
+            self.ui.text_centered(w / 2.0, y + 4.0 * s, "Coloque pacotes (pasta ou .zip) na pasta acima.", GRAY);
+        }
+        let back_y = h - 28.0 * s;
+        let back = self.ui.button(w / 2.0 - 100.0 * s, back_y, 200.0 * s, 20.0 * s, "Concluído", mouse) && self.clicked;
+        if let Some(p) = pick {
+            self.click_sound();
+            self.settings.resource_packs = p.into_iter().collect();
+            self.reload_textures();
+            self.settings.save(&self.base.join("settings.ron"));
+        }
+        if back {
+            self.click_sound();
+            self.set_screen(Screen::Options);
+        }
+    }
+
+    /// Where Esc (or the pad's back button) goes from a menu screen.
+    pub(crate) fn menu_back(&mut self) {
+        let to = match self.screen {
+            Screen::Worlds | Screen::Multiplayer => Screen::Title,
+            Screen::CreateWorld => {
+                self.new_world.rename = None;
+                Screen::Worlds
+            }
+            Screen::Voice | Screen::Packs | Screen::Keys => Screen::Options,
+            Screen::Options => {
+                if self.world_open {
+                    Screen::Paused
+                } else {
+                    Screen::Title
+                }
+            }
+            s => s,
+        };
+        self.set_screen(to);
+    }
+
+    /// The world list's small buttons: 0 rename (or bring back a deleted world), 1 duplicate,
+    /// 2 open the newest backup as a world of its own, 3 delete (second click within 4 s).
+    fn world_op(&mut self, op: usize) {
+        let Some(i) = self.world_sel.filter(|&i| i < self.worlds.len()) else { return };
+        let name = self.worlds[i].name.clone();
+        let base = self.base.clone();
+        if let Some(b) = self.worlds[i].deleted.clone() {
+            let msg = match crate::worlds::restore(&base, &name, &b) {
+                Ok(n) => format!("\"{n}\" voltou"),
+                Err(e) => format!("Não deu para recuperar: {e}"),
+            };
+            return self.world_list_changed(msg);
+        }
+        match op {
+            0 => {
+                self.new_world = NewWorldForm { name: name.clone(), rename: Some(name), ..Default::default() };
+                self.set_screen(Screen::CreateWorld);
+            }
+            1 => {
+                let msg = match crate::worlds::duplicate(&base, &name) {
+                    Ok(n) => format!("Cópia criada: \"{n}\""),
+                    Err(e) => format!("Não deu para duplicar: {e}"),
+                };
+                self.world_list_changed(msg);
+            }
+            2 => {
+                let Some(b) = self.worlds[i].backups.first().cloned() else { return };
+                let msg = match crate::worlds::restore(&base, &name, &b) {
+                    Ok(n) => format!("O backup mais novo virou o mundo \"{n}\" (o original ficou como estava)"),
+                    Err(e) => format!("Não deu para abrir o backup: {e}"),
+                };
+                self.world_list_changed(msg);
+            }
+            _ => {
+                let armed = self.new_world.delete_armed.as_ref().is_some_and(|(n, t)| *n == name && self.now - t < 4.0);
+                if !armed {
+                    self.new_world.delete_armed = Some((name, self.now));
+                    return;
+                }
+                self.new_world.delete_armed = None;
+                self.release_world(&name);
+                let msg = match crate::worlds::delete(&base, &name) {
+                    Ok(_) => format!("\"{name}\" foi apagado (ainda dá para recuperar no fim da lista)"),
+                    Err(e) => format!("Não deu para apagar: {e}"),
+                };
+                self.world_list_changed(msg);
+            }
+        }
+    }
+
+    /// Read the world list again after a change and say what happened.
+    fn world_list_changed(&mut self, msg: String) {
+        let keep = self.world_sel.and_then(|i| self.worlds.get(i)).map(|w| w.name.clone());
+        self.worlds = list_worlds(&self.base);
+        self.world_sel = keep.and_then(|n| self.worlds.iter().position(|w| w.name == n && w.deleted.is_none())).or(if self.worlds.is_empty() { None } else { Some(0) });
+        self.new_world.status = Some((msg, self.now));
+    }
+
+    /// Let go of a world's folder before it is renamed or deleted: the world behind the title
+    /// keeps writing chunks into its folder, so the panorama moves to another world, or (when
+    /// it was the only one) to the same terrain kept in a scratch folder.
+    fn release_world(&mut self, name: &str) {
+        if self.title_world != name || self.world_open {
+            return;
+        }
+        if let Some(other) = self.worlds.iter().find(|w| w.name != name && w.deleted.is_none()).map(|w| w.name.clone()) {
+            self.open_world(&other, None, None);
+            return;
+        }
+        let scratch = std::env::temp_dir().join(format!("araracraft-panorama-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let save = Arc::new(WorldSave::new(scratch));
+        let (gen, tables) = (self.world.gen.clone(), self.world.tables.clone());
+        // Dropping the old world stops its threads (and flushes what they were writing).
+        self.world = World::new(self.reg.clone(), gen, save, tables);
+        if let Some(r) = self.renderer.get_mut() {
+            r.clear_chunks();
+        }
+        self.title_world.clear();
+    }
+
+    /// Pause menu "save and quit": back to the title, keeping the world as the panorama.
+    pub(crate) fn quit_to_title(&mut self) {
+        self.save_all();
+        self.net_stop();
+        self.world_open = false;
+        self.title_world = self.world_name.clone();
+        self.set_screen(Screen::Title);
+    }
+}

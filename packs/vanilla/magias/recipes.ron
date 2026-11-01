@@ -1,0 +1,19 @@
+// The mage's new spells (plan/magias-analise.md, lote 2). Made by tools/gen_magias.py:
+// edit it and run it again.
+(
+    shaped: [
+
+    ],
+    shapeless: [
+        (ingredients: ["gold_ingot", "gold_ingot", "prismarine_shard", "prismarine_shard", "water_bucket"], result: "aqua_scepter"),
+        (ingredients: ["vile_powder", "vile_powder", "vile_powder", "stick", "emerald"], result: "creeping_thorn"),
+        (ingredients: ["magmarite_ingot", "magmarite_ingot", "blaze_rod", "poppy"], result: "flower_of_fire"),
+        (ingredients: ["book", "gelatin_crystal", "gelatin_crystal", "soul_of_light", "soul_of_light"], result: "crystal_storm"),
+        (ingredients: ["book", "soul_of_night", "soul_of_night", "vile_powder", "blaze_powder"], result: "cursed_flames"),
+        (ingredients: ["book", "soul_of_light", "soul_of_light", "copper_ingot", "redstone"], result: "magnet_sphere"),
+        (ingredients: ["obsidian", "obsidian", "soul_of_night", "shadow_scale", "echo_shard"], result: "shadow_beam"),
+        (ingredients: ["book", "tide_scale", "tide_scale", "soul_of_might", "soul_of_sight", "soul_of_fright"], result: "razorblade_typhoon"),
+        (ingredients: ["book", "nebula_fragment", "nebula_fragment", "nebula_fragment", "lumite_ingot"], result: "lunar_flare"),
+        (ingredients: ["prism_heart", "nebula_fragment", "nebula_fragment", "lumite_ingot", "diamond"], result: "prism"),
+    ],
+)

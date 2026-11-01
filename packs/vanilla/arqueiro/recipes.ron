@@ -1,0 +1,25 @@
+// Recipes of the archer class's items. Made by tools/gen_archery.py.
+(
+    shaped: [
+        (pattern: [" WS", "H S", " WS"], key: {'W': "beeswax", 'H': "honeycomb", 'S': "string"}, result: "hive_bow"),
+        (pattern: [" MS", "F S", " MS"], key: {'M': "magmarite_ingot", 'F': "phoenix_feather", 'S': "string"}, result: "batwing_bow"),
+        (pattern: [" BS", "N S", " BS"], key: {'B': "bone", 'N': "soul_of_night", 'S': "string"}, result: "marrow_bow"),
+        (pattern: [" FS", "C S", " FS"], key: {'F': "frost_shard", 'C': "frost_core", 'S': "string"}, result: "frost_bow"),
+        (pattern: [" MS", "F S", " MS"], key: {'M': "mythril_ingot", 'F': "soul_of_flight", 'S': "string"}, result: "storm_bow"),
+        (pattern: [" VS", "E S", " VS"], key: {'V': "verdite_ingot", 'E': "soul_of_sight", 'S': "string"}, result: "pulse_bow"),
+        (pattern: [" TS", "P S", " TS"], key: {'T': "serpent_tooth", 'P': "prismarine_shard", 'S': "string"}, result: "tide_bow"),
+        (pattern: [" LS", "F S", " LS"], key: {'L': "lumite_ingot", 'F': "phoenix_feather", 'S': "string"}, result: "phoenix_bow"),
+        (pattern: [" LS", "V S", " LS"], key: {'L': "lumite_ingot", 'V': "vortex_fragment", 'S': "string"}, result: "skysplit_bow"),
+        (pattern: ["MQM", "M M", "MMM"], key: {'M': "magmarite_ingot", 'Q': "hunter_quiver"}, result: "molten_quiver"),
+        (pattern: ["LQN", "S S", "SSS"], key: {'L': "soul_of_light", 'N': "soul_of_night", 'Q': "hunter_quiver", 'S': "string"}, result: "magic_quiver"),
+        (pattern: [" E ", "MSM", " M "], key: {'E': "soul_of_sight", 'S': "spyglass", 'M': "mythril_ingot"}, result: "ranger_scope"),
+    ],
+    shapeless: [
+        (ingredients: ["arrow", "arrow", "arrow", "arrow", "arrow", "bone"], result: "bone_arrow", count: 5),
+        (ingredients: ["arrow", "arrow", "arrow", "arrow", "arrow", "jungle_spore"], result: "venom_arrow", count: 5),
+        (ingredients: ["arrow", "arrow", "arrow", "arrow", "arrow", "soul_of_night"], result: "cursed_arrow", count: 5),
+        (ingredients: ["arrow", "arrow", "arrow", "arrow", "arrow", "sanguinite_ingot"], result: "ichor_arrow", count: 5),
+        (ingredients: ["arrow", "arrow", "arrow", "arrow", "arrow", "verdite_ingot"], result: "verdite_arrow", count: 5),
+        (ingredients: ["arrow", "arrow", "arrow", "arrow", "arrow", "lumite_ingot"], result: "lumite_arrow", count: 5),
+    ],
+)

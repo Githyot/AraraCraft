@@ -1,0 +1,654 @@
+//! Items: every block is also an item, and `items.ron` adds the rest (tools, food, materials).
+//! Stacks, inventories and block drops live here so they can be tested without a window.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+use crate::block::{BlockId, BlockRegistry, Shape, ToolKind, AIR};
+use crate::rng::Rng;
+
+pub type ItemId = u16;
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct ToolDef {
+    pub kind: ToolKind,
+    /// 1 wood, 2 stone, 3 iron, 4 diamond (gold is 1 but very fast).
+    pub tier: u8,
+    /// Digging speed multiplier on blocks of its kind.
+    pub speed: f32,
+    /// Melee damage (hand is 1).
+    pub damage: f32,
+    pub durability: u16,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug)]
+pub struct FoodDef {
+    /// Hunger points restored (a full bar is 20).
+    pub hunger: u8,
+    pub saturation: f32,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug)]
+pub struct ArmorDef {
+    /// 0 head, 1 chest, 2 legs, 3 feet.
+    pub slot: u8,
+    /// Armor points (a full bar is 20; each point blocks 4% of hits).
+    pub points: u8,
+    pub durability: u16,
+}
+
+/// An item as written in `items.ron`. An entry named like a block adds to that block's item.
+#[derive(Deserialize, Clone, Debug)]
+pub struct ItemDef {
+    pub name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Texture in `textures/item/`; defaults to the name.
+    #[serde(default)]
+    pub texture: Option<String>,
+    #[serde(default)]
+    pub max_stack: Option<u16>,
+    #[serde(default)]
+    pub tool: Option<ToolDef>,
+    #[serde(default)]
+    pub food: Option<FoodDef>,
+    #[serde(default)]
+    pub armor: Option<ArmorDef>,
+    /// Block placed when used on a block.
+    #[serde(default)]
+    pub places: Option<String>,
+    /// Seconds of furnace fuel.
+    #[serde(default)]
+    pub fuel: f32,
+    /// Uses before it breaks, for items that wear but are neither tools nor armor (bow, shears...).
+    #[serde(default)]
+    pub durability: Option<u16>,
+}
+
+#[derive(Deserialize)]
+struct ItemFile {
+    items: Vec<ItemDef>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Look {
+    /// Drawn like the block (a little cube, or a flat sprite for plants).
+    Block(BlockId),
+    /// A flat sprite: texture layer, counted from the start of the item textures.
+    Sprite(u16),
+}
+
+/// How many of one thing fit in a slot, like Terraria since 1.4.4: 9999 of anything that stacks at all
+/// (blocks, ores, food, arrows, potions...). Tools, armour and other one-of items stay at 1.
+pub const PILE: u16 = 9999;
+
+/// The slot size for an item whose Java edition stack is `vanilla` (64, 16 or 1).
+pub fn pile(vanilla: u16) -> u16 {
+    if vanilla > 1 { PILE } else { 1 }
+}
+
+#[derive(Clone, Debug)]
+pub struct Item {
+    pub name: String,
+    pub display_name: String,
+    pub look: Look,
+    /// Most in one slot: 9999 for anything that stacks (Terraria's pile), 1 otherwise.
+    pub max_stack: u16,
+    /// The stack size the Java edition uses (64, 16 or 1), kept for the parity test.
+    pub vanilla_stack: u16,
+    pub tool: Option<ToolDef>,
+    pub food: Option<FoodDef>,
+    pub armor: Option<ArmorDef>,
+    pub places: Option<BlockId>,
+    pub fuel: f32,
+    pub durability: Option<u16>,
+}
+
+impl Item {
+    /// How much wear the item takes before it breaks, if it wears at all.
+    pub fn max_wear(&self) -> Option<u16> {
+        self.tool.as_ref().map(|t| t.durability).or(self.armor.map(|a| a.durability)).or(self.durability)
+    }
+}
+
+pub struct ItemRegistry {
+    pub items: Vec<Item>,
+    by_name: HashMap<String, ItemId>,
+    /// Item of each block id (None for air, liquids, ...).
+    block_item: Vec<Option<ItemId>>,
+    /// Texture names for `Look::Sprite` layers, in order ("item/<name>").
+    pub textures: Vec<String>,
+}
+
+impl ItemRegistry {
+    pub fn from_ron(text: &str, blocks: &BlockRegistry) -> Result<Self, String> {
+        Self::from_ron_many(&[text], blocks)
+    }
+
+    /// Several item files read as one list, in order (the base game, then mod packs).
+    pub fn from_ron_many(texts: &[&str], blocks: &BlockRegistry) -> Result<Self, String> {
+        let mut defs = Vec::new();
+        for text in texts.iter().filter(|t| !t.trim().is_empty()) {
+            let file: ItemFile = ron::from_str(text).map_err(|e| format!("items.ron: {e}"))?;
+            defs.extend(file.items);
+        }
+        Self::from_defs(defs, blocks)
+    }
+
+    pub fn from_defs(defs: Vec<ItemDef>, blocks: &BlockRegistry) -> Result<Self, String> {
+        let mut reg = ItemRegistry { items: Vec::new(), by_name: HashMap::new(), block_item: vec![None; blocks.len()], textures: Vec::new() };
+        // Item 0 is unused so a zero id never looks like a real item.
+        reg.items.push(Item { name: "air".into(), display_name: String::new(), look: Look::Block(AIR), max_stack: 0, vanilla_stack: 0, tool: None, food: None, armor: None, places: None, fuel: 0.0, durability: None });
+        for (i, b) in blocks.blocks.iter().enumerate() {
+            if i as BlockId == AIR || matches!(b.shape, Shape::Liquid | Shape::Invisible) {
+                continue;
+            }
+            if b.variant != 0 {
+                // An orientation of another block: it is that block's item.
+                reg.block_item[i] = reg.block_item[b.base as usize];
+                continue;
+            }
+            let id = reg.items.len() as ItemId;
+            reg.items.push(Item {
+                name: b.name.clone(),
+                display_name: b.display_name.clone(),
+                look: Look::Block(i as BlockId),
+                max_stack: PILE,
+                vanilla_stack: 64,
+                tool: None,
+                food: None,
+                armor: None,
+                places: Some(i as BlockId),
+                fuel: 0.0,
+                durability: None,
+            });
+            reg.by_name.insert(b.name.clone(), id);
+            reg.block_item[i] = Some(id);
+        }
+        let mut tex_index: HashMap<String, u16> = HashMap::new();
+        for d in defs {
+            let existing = reg.by_name.get(&d.name).copied();
+            let places = match &d.places {
+                Some(n) => Some(blocks.id(n).ok_or_else(|| format!("item '{}' places unknown block '{n}'", d.name))?),
+                None => None,
+            };
+            if let Some(id) = existing {
+                // Extra facts for a block's item.
+                let it = &mut reg.items[id as usize];
+                if let Some(n) = d.display_name {
+                    it.display_name = n;
+                }
+                if let Some(m) = d.max_stack {
+                    it.vanilla_stack = m;
+                    it.max_stack = pile(m);
+                }
+                it.fuel = d.fuel.max(it.fuel);
+                it.food = d.food.or(it.food);
+                it.durability = d.durability.or(it.durability);
+                if let Some(t) = d.texture {
+                    let layer = *tex_index.entry(t.clone()).or_insert_with(|| {
+                        reg.textures.push(format!("item/{t}"));
+                        (reg.textures.len() - 1) as u16
+                    });
+                    it.look = Look::Sprite(layer);
+                }
+                continue;
+            }
+            let tex = d.texture.clone().unwrap_or_else(|| d.name.clone());
+            let layer = *tex_index.entry(tex.clone()).or_insert_with(|| {
+                reg.textures.push(format!("item/{tex}"));
+                (reg.textures.len() - 1) as u16
+            });
+            let max_stack = d.max_stack.unwrap_or(if d.tool.is_some() || d.armor.is_some() || d.durability.is_some() { 1 } else { 64 });
+            let id = reg.items.len() as ItemId;
+            reg.by_name.insert(d.name.clone(), id);
+            reg.items.push(Item {
+                display_name: d.display_name.unwrap_or_else(|| d.name.replace('_', " ")),
+                name: d.name,
+                look: Look::Sprite(layer),
+                max_stack: pile(max_stack.max(1)),
+                vanilla_stack: max_stack.max(1),
+                tool: d.tool,
+                food: d.food,
+                armor: d.armor,
+                places,
+                fuel: d.fuel,
+                durability: d.durability,
+            });
+        }
+        Ok(reg)
+    }
+
+    /// A plain item added after loading (by a plugin): a flat sprite named `texture`, at the
+    /// end of the list. None when the name is taken.
+    pub fn add_plain(&mut self, name: &str, display_name: &str, texture: &str, max_stack: u16, food: Option<FoodDef>) -> Option<ItemId> {
+        if self.by_name.contains_key(name) || self.items.len() >= ItemId::MAX as usize {
+            return None;
+        }
+        self.textures.push(format!("item/{texture}"));
+        let id = self.items.len() as ItemId;
+        self.by_name.insert(name.to_string(), id);
+        self.items.push(Item {
+            name: name.to_string(),
+            display_name: display_name.to_string(),
+            look: Look::Sprite((self.textures.len() - 1) as u16),
+            max_stack: pile(max_stack.clamp(1, 64)),
+            vanilla_stack: max_stack.clamp(1, 64),
+            tool: None,
+            food,
+            armor: None,
+            places: None,
+            fuel: 0.0,
+            durability: None,
+        });
+        Some(id)
+    }
+
+    #[inline]
+    pub fn get(&self, id: ItemId) -> &Item {
+        &self.items[id as usize]
+    }
+
+    pub fn id(&self, name: &str) -> Option<ItemId> {
+        self.by_name.get(name).copied()
+    }
+
+    pub fn of_block(&self, b: BlockId) -> Option<ItemId> {
+        self.block_item.get(b as usize).copied().flatten()
+    }
+
+    /// What breaking `block` with `tool` gives. Nothing when the block needs a better tool.
+    pub fn drops(&self, blocks: &BlockRegistry, block: BlockId, tool: Option<&ToolDef>, rng: &mut Rng) -> Vec<ItemStack> {
+        let b = blocks.get(block);
+        if !self.can_harvest(blocks, block, tool) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        match &b.drops {
+            None => {
+                // A double slab gives both halves; a door drops from its lower half only.
+                let n = if b.shape == Shape::Slab && b.variant == 2 {
+                    2
+                } else if b.shape == Shape::Layer {
+                    b.variant as u8 + 1
+                } else {
+                    1
+                };
+                let upper_door = b.shape == Shape::Door && b.variant & 8 != 0;
+                if let (Some(i), false) = (self.of_block(block), upper_door) {
+                    out.push(ItemStack::new(i, n as u16));
+                }
+            }
+            Some(list) => {
+                for d in list {
+                    if rng.f32() >= d.chance {
+                        continue;
+                    }
+                    let Some(i) = self.id(&d.item) else { continue };
+                    let n = if d.max > d.min { d.min + (rng.f32() * (d.max - d.min + 1) as f32) as u8 } else { d.min };
+                    let n = n.min(d.max.max(d.min));
+                    if n > 0 {
+                        out.push(ItemStack::new(i, n as u16));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn can_harvest(&self, blocks: &BlockRegistry, block: BlockId, tool: Option<&ToolDef>) -> bool {
+        let b = blocks.get(block);
+        if b.tier == 0 {
+            return true;
+        }
+        match (b.tool, tool) {
+            (Some(k), Some(t)) => t.kind == k && t.tier >= b.tier,
+            _ => false,
+        }
+    }
+
+    /// Seconds to dig `block` holding `tool` (classic formula: hardness × 1.5, ×5 without the
+    /// right tool for blocks that need one, divided by the tool's speed).
+    pub fn dig_time(&self, blocks: &BlockRegistry, block: BlockId, tool: Option<&ToolDef>) -> f32 {
+        let b = blocks.get(block);
+        if b.hardness < 0.0 {
+            return f32::INFINITY;
+        }
+        if b.hardness == 0.0 {
+            return 0.05;
+        }
+        let mut speed = 1.0;
+        if let (Some(k), Some(t)) = (b.tool, tool) {
+            if t.kind == k {
+                speed = t.speed;
+            }
+        }
+        // Swords cut leaves and webs quickly.
+        if let Some(t) = tool {
+            if t.kind == ToolKind::Sword && b.name.ends_with("_leaves") {
+                speed = 1.5;
+            }
+            // The hoe is the tool for leaves, moss, sculk and the like (as in Java Edition).
+            if t.kind == ToolKind::Hoe && hoe_block(&b.name) {
+                speed = speed.max(t.speed);
+            }
+            // Any sword slices a cobweb in a moment, like shears.
+            if t.kind == ToolKind::Sword && b.name == "cobweb" {
+                speed = 15.0;
+            }
+        }
+        let factor = if self.can_harvest(blocks, block, tool) { 1.5 } else { 5.0 };
+        (b.hardness * factor / speed).max(0.05)
+    }
+}
+
+/// Blocks a hoe digs fast besides its own (leaves, sculk, target, mangrove roots...).
+pub fn hoe_block(name: &str) -> bool {
+    name.ends_with("_leaves") || name.starts_with("sculk") || matches!(name, "target" | "mangrove_roots" | "muddy_mangrove_roots" | "hay_block" | "moss_carpet")
+}
+
+/// Extra data on a stack: up to eight (id, level) pairs, id 0 = empty. Ids 1..=99 are
+/// enchantments; the game also keeps an armor trim and the anvil's work count here (see
+/// `game/src/enchanting.rs`). Small and `Copy`, so stacks stay plain values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
+pub struct Ench(pub [u8; 16]);
+
+impl Ench {
+    pub const EMPTY: Ench = Ench([0; 16]);
+
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|&b| b == 0)
+    }
+
+    /// Level of `id`, 0 when absent.
+    pub fn get(&self, id: u8) -> u8 {
+        self.0.chunks(2).find(|p| p[0] == id).map(|p| p[1]).unwrap_or(0)
+    }
+
+    /// Set `id` to `level` (0 removes it). False when all eight pairs are taken.
+    pub fn set(&mut self, id: u8, level: u8) -> bool {
+        if let Some(i) = (0..8).find(|&i| self.0[i * 2] == id) {
+            if level == 0 {
+                self.0[i * 2] = 0;
+                self.0[i * 2 + 1] = 0;
+            } else {
+                self.0[i * 2 + 1] = level;
+            }
+            return true;
+        }
+        if level == 0 {
+            return true;
+        }
+        match (0..8).find(|&i| self.0[i * 2] == 0) {
+            Some(i) => {
+                self.0[i * 2] = id;
+                self.0[i * 2 + 1] = level;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The (id, level) pairs present, in slot order.
+    pub fn pairs(&self) -> impl Iterator<Item = (u8, u8)> + '_ {
+        self.0.chunks(2).filter(|p| p[0] != 0).map(|p| (p[0], p[1]))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemStack {
+    pub item: ItemId,
+    pub count: u16,
+    /// Wear on tools.
+    #[serde(default)]
+    pub damage: u16,
+    /// Enchantments and other extras.
+    #[serde(default)]
+    pub ench: Ench,
+    /// Loot rarity, sockets and the gems set in them, packed in one number (see `gems.rs`);
+    /// 0 for plain items. A field of its own, so it never mixes with wear, affixes or enchantments.
+    #[serde(default)]
+    pub sockets: u32,
+}
+
+impl ItemStack {
+    pub fn new(item: ItemId, count: u16) -> ItemStack {
+        ItemStack { item, count, damage: 0, ench: Ench::EMPTY, sockets: 0 }
+    }
+
+    /// Same item, so the two can sit in one stack.
+    pub fn stacks_with(&self, o: &ItemStack) -> bool {
+        self.item == o.item && self.damage == 0 && o.damage == 0 && self.ench == o.ench && self.sockets == o.sockets
+    }
+
+    /// Wear on a tool or armour piece (the low 12 bits of `damage`).
+    pub fn wear(&self) -> u16 {
+        self.damage & WEAR_MASK
+    }
+
+    /// The item's modifier (Etapa 5 affixes, 0 = none): the top 4 bits of `damage`.
+    pub fn affix(&self) -> u8 {
+        (self.damage >> 12) as u8
+    }
+
+    /// The same stack with this much wear, keeping its modifier.
+    pub fn with_wear(self, wear: u16) -> ItemStack {
+        ItemStack { damage: (self.damage & !WEAR_MASK) | wear.min(WEAR_MASK), ..self }
+    }
+
+    pub fn with_affix(self, affix: u8) -> ItemStack {
+        ItemStack { damage: (self.damage & WEAR_MASK) | ((affix as u16 & 0xF) << 12), ..self }
+    }
+}
+
+/// A stack as saved: item name, count, wear and sockets. Written as `("name", count, wear)` like
+/// before sockets existed, with the sockets as a fourth number only when there are any, so old
+/// saves load and plain items look the same in new ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedItem(pub String, pub u16, pub u16, pub u32);
+
+impl SavedItem {
+    pub fn of(reg: &ItemRegistry, s: &ItemStack) -> SavedItem {
+        SavedItem(reg.get(s.item).name.clone(), s.count, s.damage, s.sockets)
+    }
+
+    /// Back to a stack; None when the item no longer exists.
+    pub fn stack(&self, reg: &ItemRegistry) -> Option<ItemStack> {
+        Some(ItemStack { item: reg.id(&self.0)?, count: self.1, damage: self.2, ench: Ench::EMPTY, sockets: self.3 })
+    }
+}
+
+impl Serialize for SavedItem {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut t = ser.serialize_tuple(if self.3 != 0 { 4 } else { 3 })?;
+        t.serialize_element(&self.0)?;
+        t.serialize_element(&self.1)?;
+        t.serialize_element(&self.2)?;
+        if self.3 != 0 {
+            t.serialize_element(&self.3)?;
+        }
+        t.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for SavedItem {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = SavedItem;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("(name, count, wear) or (name, count, wear, sockets)")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<SavedItem, A::Error> {
+                use serde::de::Error;
+                let name = seq.next_element()?.ok_or_else(|| A::Error::invalid_length(0, &self))?;
+                let count = seq.next_element()?.ok_or_else(|| A::Error::invalid_length(1, &self))?;
+                let damage = seq.next_element()?.ok_or_else(|| A::Error::invalid_length(2, &self))?;
+                let sockets = seq.next_element()?.unwrap_or(0);
+                Ok(SavedItem(name, count, damage, sockets))
+            }
+        }
+        de.deserialize_tuple(4, V)
+    }
+}
+
+/// Wear fits in 12 bits (durabilities stay at or below 4000); the top 4 hold a modifier.
+pub const WEAR_MASK: u16 = 0x0FFF;
+
+/// A row of slots: the player's 36, a chest's 27, a furnace's 3.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Inventory {
+    pub slots: Vec<Option<ItemStack>>,
+}
+
+impl Inventory {
+    pub fn new(n: usize) -> Inventory {
+        Inventory { slots: vec![None; n] }
+    }
+
+    /// Put a stack in, filling matching stacks first, then empty slots in `order`.
+    /// Returns what didn't fit.
+    pub fn add_in(&mut self, reg: &ItemRegistry, mut stack: ItemStack, order: impl Iterator<Item = usize> + Clone) -> Option<ItemStack> {
+        let max = reg.get(stack.item).max_stack.max(1);
+        for i in order.clone() {
+            if let Some(s) = &mut self.slots[i] {
+                if s.stacks_with(&stack) && s.count < max {
+                    let n = (max - s.count).min(stack.count);
+                    s.count += n;
+                    stack.count -= n;
+                    if stack.count == 0 {
+                        return None;
+                    }
+                }
+            }
+        }
+        for i in order {
+            if self.slots[i].is_none() {
+                let n = stack.count.min(max);
+                self.slots[i] = Some(ItemStack { count: n, ..stack });
+                stack.count -= n;
+                if stack.count == 0 {
+                    return None;
+                }
+            }
+        }
+        Some(stack)
+    }
+
+    pub fn add(&mut self, reg: &ItemRegistry, stack: ItemStack) -> Option<ItemStack> {
+        let n = self.slots.len();
+        self.add_in(reg, stack, 0..n)
+    }
+
+    /// Take `n` from a slot, emptying it when it runs out.
+    pub fn take(&mut self, i: usize, n: u16) -> Option<ItemStack> {
+        let s = self.slots[i].as_mut()?;
+        let k = n.min(s.count);
+        s.count -= k;
+        let out = ItemStack { count: k, ..*s };
+        if s.count == 0 {
+            self.slots[i] = None;
+        }
+        (k > 0).then_some(out)
+    }
+
+    pub fn count_of(&self, item: ItemId) -> u32 {
+        self.slots.iter().flatten().filter(|s| s.item == item).map(|s| s.count as u32).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn regs() -> (BlockRegistry, ItemRegistry) {
+        let blocks = BlockRegistry::from_ron(
+            r#"(blocks: [
+                (name: "stone", hardness: 1.5, tool: Some(Pickaxe), tier: 1, drops: Some([(item: "cobblestone")])),
+                (name: "cobblestone", hardness: 2.0, tool: Some(Pickaxe), tier: 1),
+                (name: "dirt", hardness: 0.5, tool: Some(Shovel)),
+            ])"#,
+        )
+        .unwrap();
+        let items = ItemRegistry::from_ron(
+            r#"(items: [
+                (name: "wooden_pickaxe", tool: Some((kind: Pickaxe, tier: 1, speed: 2.0, damage: 2.0, durability: 59))),
+                (name: "stick"),
+            ])"#,
+            &blocks,
+        )
+        .unwrap();
+        (blocks, items)
+    }
+
+    #[test]
+    fn stone_needs_a_pickaxe() {
+        let (blocks, items) = regs();
+        let stone = blocks.id("stone").unwrap();
+        let mut rng = Rng::new(1);
+        assert!(items.drops(&blocks, stone, None, &mut rng).is_empty());
+        let pick = items.get(items.id("wooden_pickaxe").unwrap()).tool.clone().unwrap();
+        assert!(hoe_block("oak_leaves") && hoe_block("sculk_sensor") && !hoe_block("stone"));
+        let d = items.drops(&blocks, stone, Some(&pick), &mut rng);
+        assert_eq!(d.len(), 1);
+        assert_eq!(items.get(d[0].item).name, "cobblestone");
+        // The pickaxe digs faster than the bare hand.
+        assert!(items.dig_time(&blocks, stone, Some(&pick)) < items.dig_time(&blocks, stone, None) / 4.0);
+        let dirt = blocks.id("dirt").unwrap();
+        assert_eq!(items.get(items.drops(&blocks, dirt, None, &mut rng)[0].item).name, "dirt");
+    }
+
+    #[test]
+    fn old_saves_load_and_sockets_round_trip() {
+        let (_, items) = regs();
+        let pick = items.id("wooden_pickaxe").unwrap();
+        // A stack written before sockets existed, alone and inside a list of optional slots.
+        let old: SavedItem = ron::from_str(r#"("wooden_pickaxe", 1, 12)"#).unwrap();
+        assert_eq!(old.stack(&items), Some(ItemStack { item: pick, count: 1, damage: 12, ench: Ench::EMPTY, sockets: 0 }));
+        let list: Vec<Option<SavedItem>> = ron::from_str(r#"[Some(("stick", 5, 0)), None, Some(("wooden_pickaxe", 1, 3))]"#).unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[2].as_ref().unwrap().3, 0);
+        // Plain stacks are still written the old way; socketed ones carry a fourth number.
+        let plain = SavedItem::of(&items, &ItemStack::new(pick, 1));
+        assert_eq!(ron::to_string(&plain).unwrap(), r#"("wooden_pickaxe",1,0)"#);
+        let st = ItemStack { item: pick, count: 1, damage: 7, ench: Ench::EMPTY, sockets: crate::gems::set_gem(crate::gems::ranked(3), 1, Some(crate::gems::Gem { kind: 2, cut: 1 })) };
+        let text = ron::to_string(&Some(SavedItem::of(&items, &st))).unwrap();
+        let back: Option<SavedItem> = ron::from_str(&text).unwrap();
+        assert_eq!(back.unwrap().stack(&items), Some(st));
+        // A stack serialized whole (older struct form) still loads with no sockets.
+        let s: ItemStack = ron::from_str("(item: 3, count: 2, damage: 0)").unwrap();
+        assert_eq!(s.sockets, 0);
+        // Socketed gear never stacks with plain gear.
+        assert!(!st.stacks_with(&ItemStack { sockets: 0, ..st }));
+    }
+
+    #[test]
+    fn stacks_fill_then_spill() {
+        let (_, items) = regs();
+        let stick = items.id("stick").unwrap();
+        let mut inv = Inventory::new(2);
+        assert_eq!(items.get(stick).max_stack, PILE);
+        assert_eq!(items.get(stick).vanilla_stack, 64);
+        assert!(inv.add(&items, ItemStack::new(stick, 9990)).is_none());
+        assert!(inv.add(&items, ItemStack::new(stick, 20)).is_none());
+        assert_eq!(inv.slots[0].unwrap().count, 9999);
+        assert_eq!(inv.slots[1].unwrap().count, 11);
+        let left = inv.add(&items, ItemStack::new(stick, 9999)).unwrap();
+        assert_eq!(left.count, 11);
+        assert_eq!(inv.count_of(stick), 19998);
+        // Tools still sit one to a slot.
+        let pick = items.id("wooden_pickaxe").unwrap();
+        assert_eq!(items.get(pick).max_stack, 1);
+    }
+
+    #[test]
+    fn old_saves_with_small_counts_load() {
+        let (_, items) = regs();
+        let back: Option<SavedItem> = ron::from_str("Some((\"stick\", 64, 0))").unwrap();
+        assert_eq!(back.unwrap().stack(&items).unwrap().count, 64);
+        let big = SavedItem::of(&items, &ItemStack::new(items.id("stick").unwrap(), 9999));
+        let text = ron::to_string(&Some(big.clone())).unwrap();
+        assert_eq!(ron::from_str::<Option<SavedItem>>(&text).unwrap(), Some(big));
+    }
+}

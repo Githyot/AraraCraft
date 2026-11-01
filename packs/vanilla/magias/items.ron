@@ -1,0 +1,14 @@
+// The mage's new spells (plan/magias-analise.md, lote 2). Made by tools/gen_magias.py:
+// edit it and run it again.
+(items: [
+    (name: "aqua_scepter", display_name: Some("Cetro d'Água"), max_stack: Some(1)),
+    (name: "creeping_thorn", display_name: Some("Espinho Rasteiro"), max_stack: Some(1)),
+    (name: "flower_of_fire", display_name: Some("Flor de Fogo"), max_stack: Some(1)),
+    (name: "crystal_storm", display_name: Some("Tempestade de Cristal"), max_stack: Some(1)),
+    (name: "cursed_flames", display_name: Some("Chamas Malditas"), max_stack: Some(1)),
+    (name: "magnet_sphere", display_name: Some("Esfera Magnética"), max_stack: Some(1)),
+    (name: "shadow_beam", display_name: Some("Cajado do Raio Sombrio"), max_stack: Some(1)),
+    (name: "razorblade_typhoon", display_name: Some("Tufão de Lâminas"), max_stack: Some(1)),
+    (name: "lunar_flare", display_name: Some("Clarão Lunar"), max_stack: Some(1)),
+    (name: "prism", display_name: Some("Prisma"), max_stack: Some(1)),
+])

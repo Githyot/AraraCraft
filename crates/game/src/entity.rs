@@ -1,0 +1,1960 @@
+//! Mob rendering: box models from `mobs.ron` turned into meshes once, drawn instanced with one
+//! matrix per body part. Skin "layers" are voxelized at load time, so wool, fur and torn clothes
+//! stand off the body as real relief instead of a flat painting (the 3D Skin Layers idea).
+
+use std::path::Path;
+
+use glam::{Mat4, Vec3};
+use wgpu::util::DeviceExt;
+
+use crate::embedded;
+use crate::paintings::PaintingDef;
+use crate::renderer::Renderer;
+use voxel::mob::{Anim, MobDef, MobRegistry, PartDef};
+
+/// The skin layout, in model pixels (mobs.ron's texture coordinates).
+pub const SKIN_W: u32 = 64;
+pub const SKIN_H: u32 = 128;
+/// Texels per model pixel of the base game's skins (64x art: a block is 16 model pixels).
+pub const SKIN_DETAIL: u32 = 4;
+pub(crate) const MAX_PARTS: usize = 16;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct EntityVertex {
+    pos: [f32; 3],
+    uv: [f32; 2],
+    /// part index (4 bits) | shade * 255 (8 bits)
+    packed: u32,
+    layer: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Bones {
+    pub m: [[[f32; 4]; 4]; MAX_PARTS],
+    /// sky light, block light, hurt flash, swell
+    pub light: [f32; 4],
+    /// A dye over the model (Lote 11): colour, and the mode in w (0 none, 1 dyed, 2 dyed and
+    /// glowing, 3 glowing only).
+    pub tint: [f32; 4],
+    /// Knees and elbows, per part: (joint height, joint depth, bend angle, unused) in model
+    /// pixels. Limb meshes are split at the joint (see `joint`), and the shader turns
+    /// everything below it about the joint's X axis, blending over a pixel either side.
+    pub bend: [[f32; 4]; MAX_PARTS],
+}
+
+impl Default for Bones {
+    fn default() -> Self {
+        let mut m = [Mat4::IDENTITY.to_cols_array_2d(); MAX_PARTS];
+        // The last slot carries the eyelids (see `add_eyelids`): folded to a point = eyes open.
+        m[EYELID_PART] = [[0.0; 4]; 4];
+        // And the one before it the player's mouth (see `add_mouth`): folded = closed.
+        m[MOUTH_PART] = [[0.0; 4]; 4];
+        Bones { m, light: [1.0, 0.0, 0.0, 0.0], tint: [1.0, 1.0, 1.0, 0.0], bend: [[0.0; 4]; MAX_PARTS] }
+    }
+}
+
+impl Bones {
+    /// Bend part `i` (a leg or arm) at its knee or elbow by `angle` (positive swings the lower
+    /// half back, toward -Z).
+    pub fn set_bend(&mut self, i: usize, p: &PartDef, angle: f32) {
+        if let (Some((y, z)), true) = (joint(p), i < MAX_PARTS) {
+            self.bend[i] = [y, z, angle, 0.0];
+        }
+    }
+
+    /// Where the lower half of part `i` is (the forearm, for something held in the hand).
+    pub fn forearm(&self, i: usize) -> [[f32; 4]; 4] {
+        let [y, z, a, _] = self.bend[i];
+        let m = Mat4::from_cols_array_2d(&self.m[i]);
+        if a == 0.0 {
+            return self.m[i];
+        }
+        let j = Vec3::new(0.0, y, z);
+        (m * Mat4::from_translation(j) * Mat4::from_rotation_x(a) * Mat4::from_translation(-j)).to_cols_array_2d()
+    }
+}
+
+/// The knee or elbow of a limb part: halfway down, in the middle of its depth. Short legs
+/// (chickens, spiders) don't get one.
+pub(crate) fn joint(p: &PartDef) -> Option<(f32, f32)> {
+    if !matches!(p.anim, Anim::Leg(_) | Anim::Arm(_) | Anim::ArmForward(_)) || p.size.1 < 6 {
+        return None;
+    }
+    Some((p.origin.1 as f32 + (p.size.1 / 2) as f32, p.origin.2 as f32 + p.size.2 as f32 * 0.5))
+}
+
+/// Test hook for screenshots: MC_BLINK=1 keeps every mob's eyes shut.
+pub(crate) fn eyes_shut_test() -> bool {
+    static SHUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SHUT.get_or_init(|| std::env::var("MC_BLINK").is_ok())
+}
+
+/// Part slot of the eyelid quads, for models with fewer parts than that.
+pub(crate) const EYELID_PART: usize = MAX_PARTS - 1;
+/// Part slot of the player's mouth (players have six parts; mobs never get a mouth here).
+pub(crate) const MOUTH_PART: usize = MAX_PARTS - 2;
+
+struct MobMesh {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    indices: u32,
+}
+
+pub struct EntityRenderer {
+    /// [drawing straight to the screen, drawing into the HDR scene for shader packs]
+    pipelines: [wgpu::RenderPipeline; 2],
+    /// Depth only, into the sun's shadow map.
+    shadow_pipeline: wgpu::RenderPipeline,
+    skin_bg: wgpu::BindGroup,
+    inst_layout: wgpu::BindGroupLayout,
+    inst_bg: wgpu::BindGroup,
+    inst_buf: wgpu::Buffer,
+    inst_cap: usize,
+    /// The material class of each skin layer (material.rs).
+    mat_buf: wgpu::Buffer,
+    meshes: Vec<MobMesh>,
+    pub particles: crate::particles::ParticleGpu,
+    pub items: crate::item_render::ItemGpu,
+    /// Meshes after this index are paintings.
+    mob_meshes: usize,
+    /// First armour mesh (material * 4 + piece), when there is a player model to fit it to.
+    armor_meshes: Option<usize>,
+    /// First armour trim mesh (trim material * 4 + piece), drawn just over the armour.
+    trim_meshes: Option<usize>,
+    /// One mesh per pair of wings (wings.rs), both wings in it.
+    wing_meshes: usize,
+    /// First musical instrument mesh (instruments.rs order).
+    instrument_meshes: usize,
+    gun_meshes: usize,
+    /// First shield mesh (shield.rs order).
+    shield_meshes: usize,
+    summon_meshes: usize,
+    /// Per mob definition: the skin layer of its coat 1 (coat k is this + k - 1), if it has coats.
+    coat_layers: Vec<Option<u32>>,
+    spell_meshes: usize,
+    /// (mesh, first instance, count) for this frame.
+    draws: Vec<(usize, u32, u32)>,
+    /// The same for the shadow map.
+    shadow_draws: Vec<(usize, u32, u32)>,
+    pub instance_count: usize,
+}
+
+/// A skin picture: the SKIN_W × SKIN_H layout drawn with `scale` texels per model pixel.
+struct Skin {
+    pixels: Vec<u8>,
+    scale: u32,
+}
+
+impl Skin {
+    fn width(&self) -> u32 {
+        SKIN_W * self.scale
+    }
+
+    /// Opacity of model pixel (x, y), read at the middle of its texels.
+    fn alpha(&self, x: i32, y: i32) -> u8 {
+        if x < 0 || y < 0 || x >= SKIN_W as i32 || y >= SKIN_H as i32 {
+            return 0;
+        }
+        let s = self.scale;
+        let (tx, ty) = (x as u32 * s + s / 2, y as u32 * s + s / 2);
+        self.pixels[((ty * self.width() + tx) * 4 + 3) as usize]
+    }
+
+    /// The same picture with `scale` texels per model pixel (crisp growth, averaged shrinking).
+    fn rescaled(self, scale: u32) -> Skin {
+        if scale == self.scale {
+            return self;
+        }
+        Skin { pixels: fit_rgba(&self.pixels, self.width(), SKIN_H * self.scale, SKIN_W * scale, SKIN_H * scale), scale }
+    }
+}
+
+/// Resize an RGBA picture to w × h: by whole multiples with crisp pixels when it grows, by
+/// averaging when it shrinks by powers of two, nearest otherwise.
+fn fit_rgba(px: &[u8], sw: u32, sh: u32, w: u32, h: u32) -> Vec<u8> {
+    if sw == w && sh == h {
+        return px.to_vec();
+    }
+    if sw > w && sw % w == 0 && (sw / w).is_power_of_two() && sh * w == h * sw {
+        let levels = (sw / w).trailing_zeros() + 1;
+        return crate::textures::mip_chain_rect(px, sw, sh, levels).pop().unwrap();
+    }
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let (sx, sy) = (x * sw / w, y * sh / h);
+            let s = ((sy * sw + sx) * 4) as usize;
+            let d = ((y * w + x) * 4) as usize;
+            out[d..d + 4].copy_from_slice(&px[s..s + 4]);
+        }
+    }
+    out
+}
+
+/// A mob's skin at `scale` texels per model pixel. Skins may be drawn at any multiple of the
+/// 64 × 128 layout (our own are 4×, a 1× skin from an older pack still fits).
+fn load_skin(base: &Path, name: &str, scale: u32) -> Skin {
+    let bytes = std::fs::read(base.join(format!("packs/vanilla/textures/entity/{name}.png")))
+        .ok()
+        .or_else(|| embedded::ENTITY_TEXTURES.iter().find(|(n, _)| *n == name).map(|(_, b)| b.to_vec()));
+    let (w, h) = (SKIN_W * scale, SKIN_H * scale);
+    match bytes.and_then(|b| image::load_from_memory(&b).ok()) {
+        Some(img) => {
+            let img = img.to_rgba8();
+            // Pictures that are not 1:2 (old 64 × 64 skins) sit at the top of the layout.
+            let k = (img.width() / SKIN_W).max(1);
+            let mut full = vec![0u8; (SKIN_W * k * SKIN_H * k * 4) as usize];
+            for y in 0..img.height().min(SKIN_H * k) {
+                for x in 0..img.width().min(SKIN_W * k) {
+                    let i = ((y * SKIN_W * k + x) * 4) as usize;
+                    full[i..i + 4].copy_from_slice(&img.get_pixel(x, y).0);
+                }
+            }
+            Skin { pixels: fit_rgba(&full, SKIN_W * k, SKIN_H * k, w, h), scale }
+        }
+        None => {
+            log::warn!("missing mob skin '{name}'");
+            let mut pixels = vec![0u8; (w * h * 4) as usize];
+            for y in 0..64 * scale {
+                for x in 0..64 * scale {
+                    let i = ((y * w + x) * 4) as usize;
+                    let m = ((x / (8 * scale)) + (y / (8 * scale))) % 2 == 0;
+                    pixels[i..i + 4].copy_from_slice(if m { &[248, 0, 248, 255] } else { &[0, 0, 0, 255] });
+                }
+            }
+            Skin { pixels, scale }
+        }
+    }
+}
+
+/// One face of a box: where texel (0,0) sits, the directions of texture u and v, the outward normal.
+struct Face {
+    corner: Vec3,
+    u: Vec3,
+    v: Vec3,
+    n: Vec3,
+    /// Texture region (x, y, w, h) in pixels.
+    rect: (i32, i32, i32, i32),
+    shade: f32,
+}
+
+fn faces(origin: Vec3, size: Vec3, uv: (u16, u16), tex_size: (i32, i32, i32)) -> [Face; 6] {
+    let (x0, y0, z0) = (origin.x, origin.y, origin.z);
+    let (w, h, d) = (size.x, size.y, size.z);
+    let (tw, th, td) = tex_size;
+    let (u, v) = (uv.0 as i32, uv.1 as i32);
+    [
+        // +Z front
+        Face { corner: Vec3::new(x0, y0 + h, z0 + d), u: Vec3::X * w, v: Vec3::NEG_Y * h, n: Vec3::Z, rect: (u + td, v + td, tw, th), shade: 0.8 },
+        // -Z back
+        Face { corner: Vec3::new(x0 + w, y0 + h, z0), u: Vec3::NEG_X * w, v: Vec3::NEG_Y * h, n: Vec3::NEG_Z, rect: (u + 2 * td + tw, v + td, tw, th), shade: 0.8 },
+        // -X right
+        Face { corner: Vec3::new(x0, y0 + h, z0), u: Vec3::Z * d, v: Vec3::NEG_Y * h, n: Vec3::NEG_X, rect: (u, v + td, td, th), shade: 0.6 },
+        // +X left
+        Face { corner: Vec3::new(x0 + w, y0 + h, z0 + d), u: Vec3::NEG_Z * d, v: Vec3::NEG_Y * h, n: Vec3::X, rect: (u + td + tw, v + td, td, th), shade: 0.6 },
+        // +Y top
+        Face { corner: Vec3::new(x0, y0 + h, z0), u: Vec3::X * w, v: Vec3::Z * d, n: Vec3::Y, rect: (u + td, v, tw, td), shade: 1.0 },
+        // -Y bottom
+        Face { corner: Vec3::new(x0, y0, z0 + d), u: Vec3::X * w, v: Vec3::NEG_Z * d, n: Vec3::NEG_Y, rect: (u + td + tw, v, tw, td), shade: 0.5 },
+    ]
+}
+
+struct MeshBuilder {
+    verts: Vec<EntityVertex>,
+    indices: Vec<u32>,
+    layer: u32,
+    /// Knee/elbow height per part: side faces are cut there so the limb can bend.
+    joints: [Option<f32>; MAX_PARTS],
+}
+
+impl MeshBuilder {
+    fn new(layer: u32, def: Option<&MobDef>) -> MeshBuilder {
+        let mut joints = [None; MAX_PARTS];
+        if let Some(d) = def {
+            for (i, p) in d.parts.iter().enumerate().take(MAX_PARTS) {
+                joints[i] = joint(p).map(|j| j.0);
+            }
+        }
+        MeshBuilder { verts: Vec::new(), indices: Vec::new(), layer, joints }
+    }
+
+    fn quad(&mut self, p: [Vec3; 4], uv: [[f32; 2]; 4], n: Vec3, shade: f32, part: u32) {
+        let base = self.verts.len() as u32;
+        let packed = part | (((shade * 255.0) as u32) << 4);
+        for k in 0..4 {
+            self.verts.push(EntityVertex { pos: p[k].to_array(), uv: uv[k], packed, layer: self.layer });
+        }
+        // Counter-clockwise seen from outside.
+        let cross = (p[1] - p[0]).cross(p[3] - p[0]);
+        if cross.dot(n) >= 0.0 {
+            self.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        } else {
+            self.indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
+        }
+    }
+
+    fn face(&mut self, f: &Face, part: u32) {
+        let (rx, ry, rw, rh) = f.rect;
+        let uv = |x: i32, y: i32| [x as f32 / SKIN_W as f32, y as f32 / SKIN_H as f32];
+        // A side of a limb: two quads, cut at the joint.
+        if let Some(jy) = self.joints.get(part as usize).copied().flatten() {
+            let (top, bot) = (f.corner.y, f.corner.y + f.v.y);
+            if f.v.x == 0.0 && f.v.z == 0.0 && f.v.y < 0.0 && jy < top - 0.01 && jy > bot + 0.01 {
+                let s = (top - jy) / (top - bot);
+                let uvf = |x: f32, y: f32| [x / SKIN_W as f32, y / SKIN_H as f32];
+                let (x0, x1, y0, y1) = (rx as f32, (rx + rw) as f32, ry as f32, (ry + rh) as f32);
+                let ym = y0 + (y1 - y0) * s;
+                let mid = f.corner + f.v * s;
+                self.quad([f.corner, f.corner + f.u, mid + f.u, mid], [uvf(x0, y0), uvf(x1, y0), uvf(x1, ym), uvf(x0, ym)], f.n, f.shade, part);
+                self.quad([mid, mid + f.u, f.corner + f.u + f.v, f.corner + f.v], [uvf(x0, ym), uvf(x1, ym), uvf(x1, y1), uvf(x0, y1)], f.n, f.shade, part);
+                return;
+            }
+        }
+        self.quad(
+            [f.corner, f.corner + f.u, f.corner + f.u + f.v, f.corner + f.v],
+            [uv(rx, ry), uv(rx + rw, ry), uv(rx + rw, ry + rh), uv(rx, ry + rh)],
+            f.n,
+            f.shade,
+            part,
+        );
+    }
+
+    /// Relief layer: each opaque texel becomes a little block standing `depth` off the body.
+    fn relief(&mut self, f: &Face, skin: &Skin, depth: f32, part: u32) {
+        let (rx, ry, rw, rh) = f.rect;
+        if rw <= 0 || rh <= 0 {
+            return;
+        }
+        let su = f.u / rw as f32;
+        let sv = f.v / rh as f32;
+        let back = -f.n * depth;
+        for j in 0..rh {
+            for i in 0..rw {
+                if skin.alpha(rx + i, ry + 64 + j) < 128 {
+                    continue;
+                }
+                let c = f.corner + su * i as f32 + sv * j as f32;
+                let tex = [(rx + i) as f32 + 0.5, (ry + 64 + j) as f32 + 0.5];
+                let uvc = [tex[0] / SKIN_W as f32, tex[1] / SKIN_H as f32];
+                let uv4 = [uvc; 4];
+                // Outward face: the whole texel square, so a detailed skin shows its detail.
+                let uvp = |x: f32, y: f32| [x / SKIN_W as f32, y / SKIN_H as f32];
+                let (u0, v0) = ((rx + i) as f32, (ry + 64 + j) as f32);
+                let cell = [uvp(u0, v0), uvp(u0 + 1.0, v0), uvp(u0 + 1.0, v0 + 1.0), uvp(u0, v0 + 1.0)];
+                self.quad([c, c + su, c + su + sv, c + sv], cell, f.n, f.shade, part);
+                // Side walls where the neighbouring texel is empty.
+                let open = |di: i32, dj: i32| skin.alpha(rx + i + di, ry + 64 + j + dj) < 128;
+                let side_shade = (f.shade * 0.85).max(0.4);
+                if open(0, -1) {
+                    self.quad([c, c + su, c + su + back, c + back], uv4, -sv.normalize_or_zero(), side_shade, part);
+                }
+                if open(0, 1) {
+                    let b = c + sv;
+                    self.quad([b, b + su, b + su + back, b + back], uv4, sv.normalize_or_zero(), side_shade, part);
+                }
+                if open(-1, 0) {
+                    self.quad([c, c + sv, c + sv + back, c + back], uv4, -su.normalize_or_zero(), side_shade, part);
+                }
+                if open(1, 0) {
+                    let b = c + su;
+                    self.quad([b, b + sv, b + sv + back, b + back], uv4, su.normalize_or_zero(), side_shade, part);
+                }
+            }
+        }
+    }
+}
+
+fn build_mesh(def: &MobDef, skin: &Skin, layer: u32) -> (Vec<EntityVertex>, Vec<u32>) {
+    let mut mb = MeshBuilder::new(layer, Some(def));
+    // Boxes that share a face plane (a board flush with the side it meets, the floor and the
+    // walls of a cart) would flicker where both draw the same spot. Each part stands a hair
+    // further out than the one before, so one of them always wins. The head stays exact: its
+    // eyelids and mouth sit just in front of its face.
+    let head = def.parts.iter().position(|p| p.anim == Anim::Head);
+    let nudge = |pi: usize| if Some(pi) == head { 0.0 } else { pi as f32 * 0.012 };
+    for (pi, p) in def.parts.iter().enumerate() {
+        let origin = Vec3::new(p.origin.0 as f32, p.origin.1 as f32, p.origin.2 as f32) - Vec3::splat(nudge(pi));
+        let size = Vec3::new(p.size.0 as f32, p.size.1 as f32, p.size.2 as f32) + Vec3::splat(2.0 * nudge(pi));
+        let tex = (p.size.0 as i32, p.size.1 as i32, p.size.2 as i32);
+        for f in faces(origin, size, p.uv, tex).iter() {
+            mb.face(f, pi as u32);
+        }
+    }
+    add_eyelids(&mut mb, def, skin);
+    add_mouth(&mut mb, def);
+    for l in &def.layers {
+        let p = &def.parts[l.part];
+        let inflate = l.inflate.max(0.1);
+        let out = inflate + nudge(l.part);
+        let origin = Vec3::new(p.origin.0 as f32, p.origin.1 as f32, p.origin.2 as f32) - Vec3::splat(out);
+        let size = Vec3::new(p.size.0 as f32, p.size.1 as f32, p.size.2 as f32) + Vec3::splat(2.0 * out);
+        let tex = (p.size.0 as i32, p.size.1 as i32, p.size.2 as i32);
+        for f in faces(origin, size, p.uv, tex).iter() {
+            mb.relief(f, skin, out, l.part as u32);
+        }
+    }
+    (mb.verts, mb.indices)
+}
+
+/// Eyelids (Fresh Animations idea): the eye pixels on the front of the head are found in the
+/// skin, and each gets a little quad just in front of it, textured with the skin right above
+/// the eye. They ride on their own part slot, which is folded away except while blinking, so
+/// blinking costs nothing but one matrix.
+fn add_eyelids(mb: &mut MeshBuilder, def: &MobDef, skin: &Skin) {
+    if def.parts.len() > EYELID_PART || def.name == "player" {
+        return;
+    }
+    let Some(hi) = def.parts.iter().position(|p| p.anim == Anim::Head) else { return };
+    let p = &def.parts[hi];
+    let origin = Vec3::new(p.origin.0 as f32, p.origin.1 as f32, p.origin.2 as f32);
+    let size = Vec3::new(p.size.0 as f32, p.size.1 as f32, p.size.2 as f32);
+    let tex = (p.size.0 as i32, p.size.1 as i32, p.size.2 as i32);
+    let f = &faces(origin, size, p.uv, tex)[0];
+    // A relief layer on the head (3D skin layer) shows in front of the base face where it has
+    // pixels; lids for those pixels sit on the layer.
+    let layer = def.layers.iter().find(|l| l.part == hi).map(|l| {
+        let inf = l.inflate.max(0.1);
+        let fl = &faces(origin - Vec3::splat(inf), size + Vec3::splat(2.0 * inf), p.uv, tex)[0];
+        (fl.corner, fl.u, fl.v)
+    });
+    let (rx, ry, rw, rh) = f.rect;
+    if rw < 3 || rh < 3 {
+        return;
+    }
+    let raw = |x: i32, y: i32| -> [f32; 4] {
+        if x < 0 || y < 0 || x >= SKIN_W as i32 || y >= SKIN_H as i32 {
+            return [0.0; 4];
+        }
+        let k = ((y as u32 * SKIN_W + x as u32) * 4) as usize;
+        let c = &skin.pixels[k..k + 4];
+        [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, c[3] as f32 / 255.0]
+    };
+    // What shows at face pixel (i, j): (colour, skin row it comes from).
+    let px = |i: i32, j: i32| -> ([f32; 4], i32) {
+        if i < 0 || j < 0 || i >= rw || j >= rh {
+            return ([0.0; 4], ry + j);
+        }
+        if layer.is_some() {
+            let o = raw(rx + i, ry + 64 + j);
+            if o[3] > 0.5 {
+                return (o, ry + 64 + j);
+            }
+        }
+        (raw(rx + i, ry + j), ry + j)
+    };
+    let luma = |c: [f32; 4]| c[0] * 0.3 + c[1] * 0.59 + c[2] * 0.11;
+    // The face's usual colour.
+    let mut avg = [0.0f32; 3];
+    let mut n = 0.0;
+    for j in 0..rh {
+        for i in 0..rw {
+            let c = px(i, j).0;
+            if c[3] > 0.5 {
+                for k in 0..3 {
+                    avg[k] += c[k];
+                }
+                n += 1.0;
+            }
+        }
+    }
+    if n < 4.0 {
+        return;
+    }
+    avg = avg.map(|v| v / n);
+    // Eye pixels: very dark, or white, unlike the face, in the upper part of the head.
+    let eye = |i: i32, j: i32| -> bool {
+        let c = px(i, j).0;
+        if c[3] < 0.5 || j as f32 > rh as f32 * 0.6 {
+            return false;
+        }
+        let d = ((c[0] - avg[0]).powi(2) + (c[1] - avg[1]).powi(2) + (c[2] - avg[2]).powi(2)).sqrt();
+        let sat = c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2]);
+        let l = luma(c);
+        d > 0.25 && (l < 0.2 || (l > 0.78 && sat < 0.15))
+    };
+    // Eyes come in pairs: keep pixels mirrored across the face.
+    let cells: Vec<(i32, i32)> = (0..rh).flat_map(|j| (0..rw).map(move |i| (i, j))).filter(|&(i, j)| eye(i, j) && eye(rw - 1 - i, j)).collect();
+    if cells.len() < 2 || cells.len() as f32 > n * 0.2 {
+        return;
+    }
+    for &(i, j) in &cells {
+        // Lid colour: the nearest face pixel above the eye.
+        let mut lj = j - 1;
+        while lj >= 0 && (eye(i, lj) || px(i, lj).0[3] < 0.5) {
+            lj -= 1;
+        }
+        if lj < 0 {
+            lj = (j + 1..rh).find(|&b| !eye(i, b) && px(i, b).0[3] >= 0.5).unwrap_or(0);
+        }
+        let row = px(i, lj).1;
+        let t = [(rx + i) as f32 + 0.5, row as f32 + 0.5];
+        let uv = [t[0] / SKIN_W as f32, t[1] / SKIN_H as f32];
+        // On the layer when the eye pixel is drawn by it, else on the head itself.
+        let (corner, fu, fv) = match layer {
+            Some(l) if px(i, j).1 >= ry + 64 => l,
+            _ => (f.corner, f.u, f.v),
+        };
+        let su = fu / rw as f32;
+        let sv = fv / rh as f32;
+        let c = corner + su * i as f32 + sv * j as f32 + f.n * 0.04;
+        mb.quad([c, c + su, c + su + sv, c + sv], [uv; 4], f.n, f.shade, EYELID_PART as u32);
+    }
+}
+
+/// Players (voice chat) and town folk (chatting with each other, anim.rs) get a mouth: the
+/// models whose first part is a player-like 8×8×8 head.
+pub(crate) fn has_mouth(def: &MobDef) -> bool {
+    let folk = def.name.starts_with("npc_") || def.name.starts_with("settler_") || def.name == "goblin_trader";
+    (def.name == "player" || folk) && def.parts.len() <= MOUTH_PART && def.parts.first().is_some_and(|p| p.size == (8, 8, 8) && p.uv == (0, 0) && p.anim == Anim::Head)
+}
+
+/// The player's mouth, for voice chat: a dark slit on the face (rows 6..7, columns 2..6 of
+/// the head's front), coloured with the skin's own lip pixel in deep shadow. It rides on its
+/// own part slot; `player_model` opens it by stretching that slot downward from its top edge
+/// with the voice, and folds it away while silent.
+fn add_mouth(mb: &mut MeshBuilder, def: &MobDef) {
+    if !has_mouth(def) {
+        return;
+    }
+    let p = &def.parts[0];
+    let origin = Vec3::new(p.origin.0 as f32, p.origin.1 as f32, p.origin.2 as f32);
+    let size = Vec3::new(p.size.0 as f32, p.size.1 as f32, p.size.2 as f32);
+    let tex = (p.size.0 as i32, p.size.1 as i32, p.size.2 as i32);
+    let f = &faces(origin, size, p.uv, tex)[0];
+    let (rx, ry, rw, rh) = f.rect;
+    if rw < 6 || rh < 8 {
+        return;
+    }
+    let (su, sv) = (f.u / rw as f32, f.v / rh as f32);
+    let uv = [(rx + rw / 2) as f32 + 0.5, (ry + rh - 2) as f32 + 0.5];
+    let uv = [uv[0] / SKIN_W as f32, uv[1] / SKIN_H as f32];
+    let c = f.corner + su * (rw as f32 / 2.0 - 2.0) + sv * (rh as f32 - 2.0) + f.n * 0.06;
+    mb.quad([c, c + su * 4.0, c + su * 4.0 + sv, c + sv], [uv; 4], f.n, 0.26, MOUTH_PART as u32);
+}
+
+/// A painting: a canvas one pixel thick, picture on the front, wood everywhere else.
+fn painting_mesh(p: &PaintingDef, layer: u32) -> (Vec<EntityVertex>, Vec<u32>) {
+    let mut mb = MeshBuilder::new(layer, None);
+    let (w, h) = ((p.width * 16) as f32, (p.height * 16) as f32);
+    let (iw, ih) = ((p.width * 16) as i32, (p.height * 16) as i32);
+    let fs = faces(Vec3::ZERO, Vec3::new(w, h, 1.0), (0, 0), (iw, ih, 1));
+    for (k, f) in fs.into_iter().enumerate() {
+        // A see-through painting is only its picture, with no wooden board behind it.
+        if p.alpha && k != 0 {
+            continue;
+        }
+        let rect = if k == 0 { (0, 0, iw, ih) } else { (0, 64, 16, 16) };
+        let shade = if k == 0 { 1.0 } else { f.shade };
+        mb.face(&Face { rect, shade, ..f }, 0);
+    }
+    (mb.verts, mb.indices)
+}
+
+/// Armour materials, by the item-name prefix, with their colour.
+pub const ARMOR_MATERIALS: [(&str, [u8; 3]); 88] = [
+    ("leather", [134, 82, 46]),
+    ("chainmail", [150, 150, 156]),
+    ("iron", [206, 206, 206]),
+    ("golden", [236, 196, 60]),
+    ("diamond", [72, 214, 204]),
+    ("netherite", [74, 66, 70]),
+    ("copper", [206, 116, 66]),
+    ("bronze", [184, 132, 62]),
+    ("lead", [104, 112, 131]),
+    ("silver", [214, 217, 222]),
+    ("tungsten", [113, 144, 116]),
+    ("platinum", [196, 222, 230]),
+    // Terraria's other first metal (2026-11-01): the ore and bars were there, the armour wasn't.
+    ("tin", [178, 172, 150]),
+    // Hard mode metals (Etapa 5).
+    ("cobalt", [52, 98, 196]),
+    ("palladium", [222, 120, 70]),
+    ("mythril", [86, 170, 140]),
+    ("orichalcum", [214, 96, 178]),
+    ("adamantite", [196, 40, 60]),
+    ("titanium", [150, 156, 170]),
+    ("radiant", [240, 214, 110]),
+    ("verdite", [96, 206, 70]),
+    ("lumite", [120, 236, 220]),
+    // The meteor set (gen_tr.py, lote 2).
+    ("meteor", [168, 86, 44]),
+    // Lote 3: the evil lands' metals and the early sets.
+    ("umbral", [90, 58, 132]),
+    ("sanguinite", [138, 28, 34]),
+    ("hive", [212, 154, 30]),
+    ("jungle", [62, 140, 52]),
+    ("fossil", [200, 186, 150]),
+    ("necro", [176, 172, 156]),
+    ("ninja", [36, 36, 46]),
+    ("nightshade", [52, 40, 66]),
+    ("shroud", [40, 40, 50]),
+    ("eclipse", [34, 28, 50]),
+    // Lote 7: the end-game sets.
+    ("spectral", [74, 138, 196]),
+    ("sporite", [42, 80, 176]),
+    ("beetle", [90, 42, 106]),
+    ("turtle", [106, 128, 32]),
+    ("solar", [224, 90, 16]),
+    ("vortex", [24, 136, 122]),
+    ("nebula", [122, 42, 160]),
+    ("stardust", [42, 128, 196]),
+    // The mod pack's dimensions (tools/moddata/aether.py, otherside.py).
+    ("zanite", [128, 72, 200]),
+    ("gravitite", [200, 74, 180]),
+    ("valkyrie", [208, 210, 216]),
+    ("phoenix", [232, 100, 26]),
+    ("resonarium", [30, 138, 154]),
+    // The bard's clothes (bard.rs).
+    ("troubadour", [120, 40, 44]),
+    ("minstrel", [40, 66, 140]),
+    ("maestro", [30, 30, 38]),
+    ("virtuoso", [26, 30, 70]),
+    // Wizard robes, one set per school (tools/moddata/spellbooks.py).
+    ("pyromancer", [176, 52, 22]),
+    ("cryomancer", [92, 160, 214]),
+    ("electromancer", [214, 184, 50]),
+    ("priest", [228, 214, 160]),
+    ("voidwalker", [120, 46, 168]),
+    ("bloodmage", [130, 18, 30]),
+    ("cultist", [18, 110, 116]),
+    ("archevoker", [140, 120, 72]),
+    // The gladiator set of the marble caves (tr_minis.rs).
+    ("gladiator", [196, 154, 58]),
+    // The deep world's volcanic metal (deep/items.ron): black rock with glowing cracks.
+    ("magmarite", [66, 50, 44]),
+    // Vanity outfits (Lote 11, vanity.rs): cloth, no armour points.
+    ("tuxedo", [44, 44, 54]),
+    ("pirate", [150, 40, 34]),
+    ("explorer", [168, 132, 84]),
+    ("royal", [112, 60, 168]),
+    // Vanity clothes, worn over the armour (tr_style.rs).
+    ("vanity_pirate", [154, 42, 34]),
+    ("vanity_wizard", [74, 42, 138]),
+    ("vanity_tuxedo", [36, 36, 44]),
+    ("vanity_explorer", [128, 100, 52]),
+    ("vanity_sailor", [42, 78, 168]),
+    ("vanity_ranger", [46, 106, 46]),
+    ("vanity_royal", [196, 148, 24]),
+    ("vanity_shadow", [42, 34, 56]),
+    // Armour dyed in the dye vat (tr_style.rs): it takes the dye's colour.
+    ("dye_white", [233, 236, 236]),
+    ("dye_orange", [240, 118, 19]),
+    ("dye_magenta", [189, 68, 179]),
+    ("dye_light_blue", [58, 175, 217]),
+    ("dye_yellow", [248, 198, 39]),
+    ("dye_lime", [112, 185, 25]),
+    ("dye_pink", [237, 141, 172]),
+    ("dye_gray", [62, 68, 71]),
+    ("dye_light_gray", [142, 142, 134]),
+    ("dye_cyan", [21, 137, 145]),
+    ("dye_purple", [121, 42, 172]),
+    ("dye_blue", [53, 57, 157]),
+    ("dye_brown", [114, 71, 40]),
+    ("dye_green", [84, 109, 27]),
+    ("dye_red", [160, 39, 34]),
+    ("dye_black", [20, 21, 25]),
+];
+
+/// Whether item `name` is a piece of one of our armour sets (`<material>_helmet` and so on, not
+/// the dye-vat colours): its icon is drawn from the worn 3D piece, never taken from a pack.
+pub fn is_armor_icon(name: &str) -> bool {
+    ["_helmet", "_chestplate", "_leggings", "_boots"]
+        .iter()
+        .find_map(|s| name.strip_suffix(s))
+        .is_some_and(|m| !m.starts_with("dye_") && ARMOR_MATERIALS.iter().any(|(n, _)| *n == m))
+}
+
+/// The boxes of one armour piece (helmet, chestplate, leggings, boots) on the player model:
+/// (part, origin, size, texture-net origin, inflate). Every box has its own place in the
+/// 64×64 armour texture.
+fn armor_boxes(def: &MobDef, piece: usize) -> Vec<(usize, Vec3, Vec3, (u16, u16), f32)> {
+    let part = |i: usize| {
+        let p = &def.parts[i];
+        (Vec3::new(p.origin.0 as f32, p.origin.1 as f32, p.origin.2 as f32), Vec3::new(p.size.0 as f32, p.size.1 as f32, p.size.2 as f32))
+    };
+    if def.parts.len() < 6 {
+        return Vec::new();
+    }
+    let mut v = Vec::new();
+    match piece {
+        0 => {
+            let (o, sz) = part(0);
+            v.push((0, o, sz, (0, 0), 1.0));
+        }
+        1 => {
+            let (o, sz) = part(1);
+            v.push((1, o, sz, (32, 0), 1.0));
+            for (k, uv) in [(2, (0, 16)), (3, (16, 16))] {
+                let (o, sz) = part(k);
+                // Sleeves cover the upper arm.
+                v.push((k, o + Vec3::Y * 5.0, Vec3::new(sz.x, sz.y - 5.0, sz.z), uv, 1.0));
+            }
+        }
+        2 => {
+            let (o, sz) = part(1);
+            v.push((1, o, Vec3::new(sz.x, 5.0, sz.z), (0, 32), 0.6));
+            for (k, uv) in [(4, (32, 16)), (5, (48, 16))] {
+                let (o, sz) = part(k);
+                v.push((k, o + Vec3::Y * 3.0, Vec3::new(sz.x, sz.y - 3.0, sz.z), uv, 0.6));
+            }
+        }
+        _ => {
+            for (k, uv) in [(4, (24, 32)), (5, (40, 32))] {
+                let (o, sz) = part(k);
+                v.push((k, o, Vec3::new(sz.x, 4.0, sz.z), uv, 1.0));
+            }
+        }
+    }
+    v
+}
+
+/// How a set of armour is built, so every metal reads differently at a glance (HP, 2026-10-28):
+/// the pattern painted on the plates and the extra pieces that stick out of the body.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArmorStyle {
+    /// The classic look, one colour (most mod and Terraria sets, cloth outfits).
+    Plain,
+    /// Stitched seams, laces on the chest, matte.
+    Leather,
+    /// A mesh of rings.
+    Mail,
+    /// Riveted steel plates with a ridge down the chest, pauldrons, knee cops, tassets, sabatons.
+    Plate,
+    /// Engraved scrollwork, a sun on the chest with a ruby, a crowned helm, rounded pauldrons.
+    Ornate,
+    /// Cut like a gem: flat facets and sparkles, a fin on the helm and spikes on the shoulders.
+    Facet,
+    /// Dark, heavy and spiked: horns on the helm, spiked pauldrons, rust-red seams.
+    Spiked,
+    /// Roman bands with green patina, a red transverse crest and a strap skirt.
+    Roman,
+    /// Greek bronze: a sculpted chest, a black plume and a strap skirt.
+    Greek,
+    /// Thick horizontal bands with big rivets and square pauldrons.
+    Banded,
+    /// Gothic: polished, fluted plates and long pointed toes.
+    Gothic,
+    /// Overlapping scales.
+    Scale,
+    /// Samurai: laced lames, a flared neck guard, gold horns, shoulder boards and a lame apron.
+    Samurai,
+    /// Black volcanic rock split by glowing cracks, jagged spikes on the helm.
+    Volcanic,
+    /// Engraved waves (the tide knight).
+    Wave,
+    /// Engraved sun rays and a mane pattern (the lion).
+    Mane,
+    /// Leaf-shaped plates with veins and a vine along the rims (the elf).
+    Elven,
+    /// Overlapping petals.
+    Petal,
+    /// Hexagonal plates with fine seams.
+    Hex,
+    /// Bark grain with moss.
+    Bark,
+    /// A dark field of stars and nebula clouds.
+    Cosmic,
+    /// Pitted space rock.
+    Rock,
+    /// Organic veins pulsing under the surface.
+    Veins,
+    /// Bold horizontal bands (the bee).
+    Stripes,
+    /// Bone: ribs on the chest, cracks and knuckles.
+    Bone,
+    /// Diagonal cloth wraps.
+    Wrap,
+    /// Glossy cap with round spots.
+    Spots,
+    /// Glossy chitin with a seam down the middle.
+    Shell,
+    /// Sun flares: rays radiating from the chest.
+    Flare,
+    /// Swirls.
+    Swirl,
+    /// Stars and constellation lines.
+    Stars,
+    /// Rows of overlapping feathers.
+    Feather,
+    /// Concentric rings.
+    Rings,
+    /// Woven cloth with an embroidered hem.
+    Robe,
+}
+
+pub fn armor_style(material: &str) -> ArmorStyle {
+    use ArmorStyle::*;
+    match material {
+        "leather" => Leather,
+        "chainmail" => Mail,
+        "iron" | "titanium" => Plate,
+        "golden" | "orichalcum" => Ornate,
+        "diamond" | "lumite" => Facet,
+        "netherite" | "adamantite" => Spiked,
+        "copper" | "gladiator" => Roman,
+        "bronze" => Greek,
+        "lead" => Banded,
+        "silver" | "cobalt" => Gothic,
+        "tungsten" | "mythril" => Scale,
+        "platinum" => Samurai,
+        "magmarite" => Volcanic,
+        _ => Plain,
+    }
+}
+
+/// A little value noise for armour patterns (patina, cracks): 0..1, smooth over model pixels.
+fn armor_noise(x: f32, y: f32, seed: i32) -> f32 {
+    let h = |i: i32, j: i32| {
+        let n = (i.wrapping_mul(374761393) ^ j.wrapping_mul(668265263) ^ seed.wrapping_mul(1274126177)) as u32;
+        let n = (n ^ (n >> 13)).wrapping_mul(1274126177);
+        (n >> 8) as f32 / (1u32 << 24) as f32
+    };
+    let (i, j) = (x.floor() as i32, y.floor() as i32);
+    let (fx, fy) = (x - x.floor(), y - y.floor());
+    let (sx, sy) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
+    let a = h(i, j) + (h(i + 1, j) - h(i, j)) * sx;
+    let b = h(i, j + 1) + (h(i + 1, j + 1) - h(i, j + 1)) * sx;
+    a + (b - a) * sy
+}
+
+/// Our own armour picture for one material, drawn in the classic style at `scale` texels per
+/// model pixel: a softly speckled metal surface with a thin dark rim and a lit bevel where plates
+/// meet, round glints in the top corners, a collar and belly plates on the chest, a belt and knee
+/// caps on the leggings, soles and cuffs on the boots and a crest on the helmet. On top of that
+/// each material's style (`armor_style`) paints its own pattern and its extra pieces.
+fn armor_skin(def: &MobDef, name: &str, color: [u8; 3], scale: u32) -> Skin {
+    use crate::armor_design::Visor;
+    use ArmorStyle::*;
+    let design = crate::armor_design::design(name, color);
+    let (style, pal) = (design.style, design.pal);
+    let fc = |c: [u8; 3]| [c[0] as f32, c[1] as f32, c[2] as f32];
+    let chain = style == Mail;
+    let matte = matches!(style, Leather | Robe | Wrap | Bark) || crate::vanity::OUTFITS.contains(&name);
+    let sc = scale.max(1);
+    let w = SKIN_W * sc;
+    let mut pixels = vec![0u8; (w * SKIN_H * sc * 4) as usize];
+    let glint = match style {
+        _ if matte => 0.18,
+        Gothic | Facet | Samurai | Shell | Spots => 0.62,
+        Volcanic | Spiked | Banded | Rock | Bone | Veins => 0.28,
+        _ => 0.5,
+    };
+    let speck = [0.74, 0.84, 0.84, 0.9, 0.9, 0.9, 0.96, 0.96, 0.96, 0.96, 1.0, 1.0, 1.0, 1.04, 1.08, 0.8];
+    for piece in 0..4 {
+        for (b, (_, _, size, uv, _)) in armor_boxes(def, piece).into_iter().enumerate() {
+            let tex = (size.x as i32, size.y as i32, size.z as i32);
+            for (fi, f) in faces(Vec3::ZERO, size, uv, tex).iter().enumerate() {
+                let (rx, ry, rw, rh) = f.rect;
+                let front = fi == 0;
+                let top = fi == 4;
+                let bottom = fi == 5;
+                for j in 0..rh {
+                    for i in 0..rw {
+                        let (x, y) = (rx + i, ry + j);
+                        if x < 0 || y < 0 || x >= 64 || y >= 64 {
+                            continue;
+                        }
+                        let mut k = 1.0f32;
+                        let mut white = 0.0f32;
+                        let edge = i == 0 || j == 0 || i == rw - 1 || j == rh - 1;
+                        let mut a = 255u8;
+                        if bottom {
+                            k *= 0.7;
+                        }
+                        let mid = rw / 2;
+                        match piece {
+                            0 => {
+                                // Helmet: open below the brow, with a dark lip over the eyes and a
+                                // raised crest along the top.
+                                let inside = i >= 1 && i < rw - 1;
+                                let nose = i == mid || i == mid - 1;
+                                let open = match design.visor {
+                                    // Corinthian: a T opening between the cheek plates.
+                                    Visor::TSlot => (j == 3 || j == 4) && inside && !nose || j >= 5 && nose,
+                                    // Cheek guards down both sides.
+                                    Visor::Cheeks => j >= 3 && i >= 2 && i < rw - 2,
+                                    // Closed helms with an eye slit at the eyes (and breathing slots).
+                                    Visor::Slit | Visor::Band => j == 4 && inside,
+                                    Visor::Breaths => j == 4 && inside || j >= 5 && j <= 6 && nose,
+                                    // A nasal bar down the open face.
+                                    Visor::Nasal => j >= 3 && inside && !nose,
+                                    Visor::Eyes => j == 4 && (i == 1 || i == 2 || i == rw - 3 || i == rw - 2),
+                                    Visor::Closed => false,
+                                    Visor::Open => j >= 3 && inside,
+                                };
+                                if front && open {
+                                    a = 0;
+                                }
+                                if front && j == 2 && i >= 1 && i < rw - 1 {
+                                    k *= 0.74;
+                                }
+                                if top && (i == mid || i == mid - 1) {
+                                    k *= 1.12;
+                                    white = glint * 0.4;
+                                }
+                            }
+                            1 if b == 0 => {
+                                // Chestplate: a V collar, belly plates and a lit breast.
+                                if front && j == 1 && (i - mid).abs() <= 1 {
+                                    k *= 0.7;
+                                }
+                                if (front || fi == 1) && j > 2 && j == rh - 4 && !edge {
+                                    k *= 0.78;
+                                }
+                                if front && j > 1 && j < 5 && (i == 2 || i == rw - 3) {
+                                    k *= 1.08;
+                                }
+                            }
+                            1 => {
+                                // Shoulder plates: lit on top, a dark lower rim.
+                                if j == 1 && !top && !bottom {
+                                    k *= 1.12;
+                                }
+                                if j == rh - 2 && !top && !bottom {
+                                    k *= 0.86;
+                                }
+                            }
+                            2 if b == 0 => {
+                                // Leggings belt with a buckle in front.
+                                if j == 1 && !top && !bottom {
+                                    k *= 0.72;
+                                    if front && (i == mid || i == mid - 1) {
+                                        k = 1.1;
+                                        white = glint;
+                                    }
+                                }
+                            }
+                            2 => {
+                                // Knee caps.
+                                let knee = rh / 2;
+                                if front && (j == knee || j == knee - 1) && i >= 1 && i < rw - 1 {
+                                    k *= if j == knee - 1 { 1.1 } else { 0.8 };
+                                }
+                            }
+                            _ => {
+                                // Boots: a lit cuff, a dark sole and a shiny toe.
+                                if j == 0 && !top && !bottom {
+                                    k = 1.04;
+                                }
+                                if j == rh - 1 && !top && !bottom {
+                                    k *= 0.6;
+                                }
+                                if front && j == rh - 2 && i >= 1 && i < rw - 1 {
+                                    k *= 1.1;
+                                }
+                            }
+                        }
+                        // Every model pixel is `sc` × `sc` texels; details are drawn at that finer size.
+                        for sj in 0..sc {
+                            for si in 0..sc {
+                                let fx = i as f32 + (si as f32 + 0.5) / sc as f32;
+                                let fy = j as f32 + (sj as f32 + 0.5) / sc as f32;
+                                let (tx, ty) = ((x as u32 * sc + si) as i32, (y as u32 * sc + sj) as i32);
+                                let h = (((tx * 73 + ty * 151) ^ (tx * ty * 17)) + (tx * 31 ^ ty * 7)) & 15;
+                                // Soft speckle: the classic flecks, at a third less contrast.
+                                let mut kk = k * (1.0 + (speck[h as usize] - 0.93) * if matte { 0.65 } else { 0.25 });
+                                let mut wh = white;
+                                let mut aa = a;
+                                // A thin dark rim around each plate and a lit bevel just inside it.
+                                let rim = (fx.min(fy).min(rw as f32 - fx).min(rh as f32 - fy)) * sc as f32;
+                                if !top && !bottom {
+                                    if rim < 1.0 {
+                                        kk *= 0.62;
+                                    } else if rim < 2.0 && (fx < 1.0 || fy < 1.0) {
+                                        kk *= 1.1;
+                                    } else if rim < 2.0 {
+                                        kk *= 0.86;
+                                    }
+                                }
+                                // Round glint in the top-left corner of each face.
+                                if !bottom {
+                                    let d = ((fx - 1.4).powi(2) + (fy - 1.4).powi(2)).sqrt();
+                                    wh = wh.max(glint * (1.0 - d / 1.2).clamp(0.0, 1.0));
+                                }
+                                if !edge && h == 15 && !matte && j < rh / 2 {
+                                    wh = wh.max(glint * 0.3);
+                                }
+                                if chain && !(piece == 0 && front && j < 3) && !edge {
+                                    let (cx, cy) = (fx.fract() - 0.5, fy.fract() - 0.5);
+                                    let r = (cx * cx + cy * cy).sqrt();
+                                    if r < 0.2 || ((i + j) % 2 == 1 && r > 0.46) {
+                                        aa = 0;
+                                    }
+                                    kk *= 1.0 + (0.3 - r) * 0.5 - cy * 0.3;
+                                }
+                                let mut col = [color[0] as f32, color[1] as f32, color[2] as f32];
+                                let side = !top && !bottom;
+                                let (rwf, rhf, midf) = (rw as f32, rh as f32, rw as f32 / 2.0);
+                                let inner = fx.min(fy).min(rwf - fx).min(rhf - fy);
+                                let seed = (piece * 8 + b * 2 + fi) as i32;
+                                match style {
+                                    Leather => {
+                                        // Stitched seams just inside each panel, laces down the chest.
+                                        if side && (inner - 0.7).abs() < 0.13 && ((fx + fy) * 1.6).fract() < 0.55 {
+                                            col = [214.0, 190.0, 140.0];
+                                            kk = 1.0;
+                                        }
+                                        if piece == 1 && b == 0 && front && (fx - midf).abs() < 1.1 && fy > 0.6 && fy < 6.5 {
+                                            let t = (fy * 1.2).fract();
+                                            if ((fx - midf).abs() - (0.5 - (t - 0.5).abs()) * 2.0).abs() < 0.2 {
+                                                col = [180.0, 154.0, 106.0];
+                                                kk = 1.05;
+                                            }
+                                        }
+                                    }
+                                    Plate | Spiked | Banded => {
+                                        // Rivets in the plate corners.
+                                        for (cx, cy) in [(0.9, 0.9), (rwf - 0.9, 0.9), (0.9, rhf - 0.9), (rwf - 0.9, rhf - 0.9)] {
+                                            let d = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
+                                            if side && d < 0.32 {
+                                                kk = 1.15;
+                                                wh = wh.max(glint * 0.6);
+                                                if style == Spiked {
+                                                    col = [150.0, 104.0, 74.0];
+                                                }
+                                            } else if side && d < 0.48 {
+                                                kk *= 0.7;
+                                            }
+                                        }
+                                        if style == Plate && piece == 1 && b == 0 && front {
+                                            kk *= if fx < midf { 1.07 } else { 0.92 };
+                                            if fy > rhf - 4.0 && fy.fract() < 0.2 {
+                                                kk *= 0.72;
+                                            }
+                                        }
+                                        if style == Spiked && side && (fy % 3.0) < 0.22 {
+                                            col = [120.0, 54.0, 44.0];
+                                        }
+                                        if style == Banded && side {
+                                            let t = fy % 2.5;
+                                            kk *= if t < 0.3 { 0.66 } else if t < 0.6 { 1.12 } else { 1.0 };
+                                            if (fx < 0.9 || fx > rwf - 0.9) && (t - 1.4).abs() < 0.3 {
+                                                kk = 1.2;
+                                            }
+                                        }
+                                    }
+                                    Ornate => {
+                                        // Engraved scrollwork along the rims; a sun with a ruby on the chest and brow.
+                                        let wave = 1.05 + 0.22 * (fx * 3.1 + fy * 2.3).sin();
+                                        if side && (inner - wave).abs() < 0.11 {
+                                            kk *= 0.72;
+                                        }
+                                        let gem = match piece {
+                                            1 if b == 0 && front => Some((midf, 4.5)),
+                                            0 if front => Some((midf, 1.4)),
+                                            _ => None,
+                                        };
+                                        if let Some((gx, gy)) = gem {
+                                            let r = ((fx - gx).powi(2) + (fy - gy).powi(2)).sqrt();
+                                            let a = (fy - gy).atan2(fx - gx);
+                                            if r < 0.55 {
+                                                col = [196.0, 30.0, 44.0];
+                                                kk = if fx < gx && fy < gy { 1.35 } else { 1.0 };
+                                            } else if piece == 1 && r < 2.4 && (a * 12.0).cos() > 0.5 && r > 1.0 {
+                                                kk *= 0.76;
+                                            }
+                                        }
+                                    }
+                                    Facet => {
+                                        // Flat facets, a different brightness each, and sparkles.
+                                        let a = fx / rwf - fy / rhf;
+                                        let c = fx / rwf + fy / rhf - 1.0;
+                                        kk *= match (a > 0.0, c > 0.0) {
+                                            (true, true) => 0.84,
+                                            (true, false) => 1.14,
+                                            (false, true) => 0.94,
+                                            (false, false) => 1.05,
+                                        };
+                                        if h == 15 && (tx + ty) % 3 == 0 {
+                                            wh = wh.max(0.7);
+                                        }
+                                    }
+                                    Roman | Greek => {
+                                        if style == Roman && side && (piece == 1 || piece == 2) {
+                                            let t = fy % 1.5;
+                                            kk *= if t < 0.18 { 0.72 } else if t < 0.4 { 1.1 } else { 1.0 };
+                                        }
+                                        if style == Greek && piece == 1 && b == 0 && front {
+                                            let g = |x: f32, y: f32, sx: f32, sy: f32| (-((fx - x) / sx).powi(2) - ((fy - y) / sy).powi(2)).exp();
+                                            let bump = g(midf - 2.0, 3.0, 1.8, 1.4) + g(midf + 2.0, 3.0, 1.8, 1.4)
+                                                + [6.5, 8.3, 10.1].iter().map(|&y| g(midf - 0.9, y, 0.8, 0.7) + g(midf + 0.9, y, 0.8, 0.7)).sum::<f32>() * 0.6;
+                                            kk *= 0.9 + bump * 0.28;
+                                        }
+                                        let p = armor_noise(fx * 0.9, fy * 0.9, seed);
+                                        if side && p > if style == Roman { 0.72 } else { 0.8 } {
+                                            col = [82.0, 160.0, 136.0];
+                                        }
+                                    }
+                                    Gothic => {
+                                        if side {
+                                            kk *= 1.0 + 0.14 * (fx * std::f32::consts::TAU / 1.5).sin();
+                                        }
+                                    }
+                                    Scale => {
+                                        let row = (fy / 1.2).floor();
+                                        let sx = fx / 1.6 + if row as i32 % 2 == 0 { 0.0 } else { 0.5 };
+                                        let (lx, ly) = (sx.fract() - 0.5, (fy / 1.2).fract());
+                                        let d = (lx * lx * 1.2 + (ly - 0.2).powi(2) * 0.8).sqrt();
+                                        kk *= 1.12 - ly * 0.3;
+                                        if d > 0.5 && ly > 0.45 {
+                                            kk *= 0.66;
+                                        }
+                                    }
+                                    Samurai => {
+                                        if side {
+                                            let t = fy % 1.6;
+                                            kk *= if t > 1.38 { 0.7 } else { 1.0 + (1.0 - t / 1.6) * 0.1 };
+                                            if ((fx % 2.0) - 1.0).abs() < 0.16 && t < 1.2 && !edge {
+                                                col = [46.0, 62.0, 136.0];
+                                                kk = 1.0;
+                                            }
+                                        }
+                                    }
+                                    Volcanic => {
+                                        let n = armor_noise(fx * 0.8, fy * 0.8, seed);
+                                        let vein = ((fx * 1.3 + (fy * 0.9).sin() * 1.6 + n * 3.0).sin()).abs();
+                                        kk *= 0.9 + n * 0.2;
+                                        if vein < 0.09 && side {
+                                            col = [255.0, 150.0, 40.0];
+                                            kk = 1.0;
+                                            wh = wh.max(0.15);
+                                        }
+                                    }
+                                    Wave => {
+                                        let t = (fy + (fx * 0.9 + seed as f32).sin() * 0.8).rem_euclid(2.4);
+                                        if side {
+                                            kk *= if t < 0.25 { 0.7 } else if t < 0.55 { 1.12 } else { 1.0 };
+                                        }
+                                    }
+                                    Mane => {
+                                        if piece == 1 && b == 0 && front {
+                                            let (dx, dy) = (fx - midf, fy - 5.0);
+                                            let r = (dx * dx + dy * dy).sqrt();
+                                            if r > 1.2 && ((dy.atan2(dx)) * 8.0).cos() > 0.55 {
+                                                kk *= 0.8;
+                                            }
+                                            if r < 1.2 {
+                                                col = fc(pal.trim);
+                                            }
+                                        } else if side && (inner - 0.9).abs() < 0.14 {
+                                            kk *= 0.74;
+                                        }
+                                    }
+                                    Elven => {
+                                        let t = (fy - (fx - midf).abs() * 0.6).rem_euclid(2.2);
+                                        if side && t < 0.22 {
+                                            kk *= 0.76;
+                                        }
+                                        if side && (inner - 0.75).abs() < 0.14 {
+                                            col = fc(pal.leaf);
+                                            kk = 1.0;
+                                        }
+                                    }
+                                    Petal => {
+                                        let row = (fy / 2.0).floor();
+                                        let lx = (fx / 2.0 + row * 0.5).fract() - 0.5;
+                                        let ly = (fy / 2.0).fract();
+                                        let d = (lx * lx * 2.0 + (ly - 0.1).powi(2)).sqrt();
+                                        if side {
+                                            kk *= 1.1 - ly * 0.25;
+                                            if d > 0.75 && ly > 0.5 {
+                                                kk *= 0.7;
+                                            }
+                                            if ly < 0.25 && lx.abs() < 0.2 {
+                                                col = fc(pal.accent);
+                                            }
+                                        }
+                                    }
+                                    Hex => {
+                                        // Nearest centre of two offset lattices, then the hexagon's distance.
+                                        let (px, py) = (fx / 1.6, fy / 1.6);
+                                        let (rx, ry) = (1.0f32, 1.732f32);
+                                        let ax = px.rem_euclid(rx) - rx * 0.5;
+                                        let ay = py.rem_euclid(ry) - ry * 0.5;
+                                        let bx = (px - rx * 0.5).rem_euclid(rx) - rx * 0.5;
+                                        let by = (py - ry * 0.5).rem_euclid(ry) - ry * 0.5;
+                                        let (gx, gy) = if ax * ax + ay * ay < bx * bx + by * by { (ax, ay) } else { (bx, by) };
+                                        let d = gx.abs().max(gx.abs() * 0.5 + gy.abs() * 0.866);
+                                        if side && d > 0.45 {
+                                            kk *= 0.66;
+                                        } else if side && d > 0.38 && gy < 0.0 {
+                                            kk *= 1.12;
+                                        }
+                                    }
+                                    Bark => {
+                                        kk *= 0.82 + 0.32 * armor_noise(fx * 2.5, fy * 0.3, seed);
+                                        if armor_noise(fx * 0.5, fy * 0.5, seed + 9) > 0.68 {
+                                            col = fc(pal.leaf).map(|c| c * 0.8);
+                                        }
+                                    }
+                                    Cosmic => {
+                                        let n = armor_noise(fx * 0.4, fy * 0.4, seed);
+                                        let g = fc(pal.glow);
+                                        let t = ((n - 0.55).max(0.0) * 1.4).min(0.6);
+                                        col = [0, 1, 2].map(|c| col[c] * (0.7 - t) + g[c] * t);
+                                        if h == 15 && (tx + ty) % 5 == 0 {
+                                            wh = wh.max(0.8);
+                                        }
+                                    }
+                                    Rock => {
+                                        let n = armor_noise(fx * 1.2, fy * 1.2, seed);
+                                        kk *= 0.85 + n * 0.3;
+                                        if n < 0.22 {
+                                            kk *= 0.66;
+                                        }
+                                    }
+                                    Veins => {
+                                        let n = armor_noise(fx * 0.7, fy * 0.7, seed);
+                                        if side && ((fx * 0.8 + n * 4.0).sin()).abs() < 0.1 {
+                                            col = fc(pal.accent).map(|c| (c * 1.5).min(255.0));
+                                            kk = 1.1;
+                                        }
+                                        kk *= 0.92 + n * 0.16;
+                                    }
+                                    Stripes => {
+                                        if (piece == 1 || piece == 2) && ((fy / 2.5).floor() as i32) % 2 == 1 {
+                                            col = fc(pal.accent);
+                                        }
+                                    }
+                                    Bone => {
+                                        if piece == 1 && b == 0 && (front || fi == 1) {
+                                            let t = (fy - (fx - midf).abs() * 0.35).rem_euclid(2.2);
+                                            kk *= if t < 0.8 { 1.12 } else { 0.8 };
+                                            if (fx - midf).abs() < 0.6 {
+                                                kk = 1.15;
+                                            }
+                                        } else if ((fx * 0.6 + armor_noise(fx, fy, seed) * 3.0).sin()).abs() < 0.05 {
+                                            kk *= 0.7;
+                                        }
+                                    }
+                                    Wrap => {
+                                        if side && (fx + fy).rem_euclid(2.0) < 0.25 {
+                                            kk *= 0.72;
+                                        }
+                                    }
+                                    Spots => {
+                                        let (cx, cy) = ((fx / 3.0).fract() - 0.5, (fy / 3.0 + (fx / 3.0).floor() * 0.5).fract() - 0.5);
+                                        if side && (cx * cx + cy * cy).sqrt() < 0.22 {
+                                            col = fc(pal.glow);
+                                            kk = 1.0;
+                                        }
+                                    }
+                                    Shell => {
+                                        kk *= 1.0 + (1.0 - fy / rhf) * 0.15;
+                                        if side && (front || fi == 1) && (fx - midf).abs() < 0.18 {
+                                            kk *= 0.6;
+                                        }
+                                    }
+                                    Flare => {
+                                        let (dx, dy) = (fx - midf, fy - rhf * 0.4);
+                                        let a = dy.atan2(dx);
+                                        if piece == 1 && b == 0 && front && (a * 6.0).cos() > 0.7 {
+                                            col = fc(pal.glow);
+                                            kk = 1.0;
+                                        }
+                                    }
+                                    Swirl => {
+                                        let (dx, dy) = (fx - midf, fy - rhf * 0.5);
+                                        let r = (dx * dx + dy * dy).sqrt();
+                                        if side && (r * 1.6 - dy.atan2(dx) * 2.0).sin() > 0.88 {
+                                            col = fc(pal.glow).map(|c| c * 0.8);
+                                            kk = 1.0;
+                                        }
+                                    }
+                                    Stars => {
+                                        if h == 15 && (tx * 3 + ty) % 4 == 0 {
+                                            wh = wh.max(0.85);
+                                        }
+                                        if side && (fx * 0.7 - fy * 0.4 + seed as f32).rem_euclid(5.0) < 0.12 {
+                                            col = fc(pal.glow);
+                                            kk = 0.9;
+                                        }
+                                    }
+                                    Feather => {
+                                        let row = (fy / 1.8).floor();
+                                        let lx = (fx / 1.4 + row * 0.5).fract();
+                                        let ly = (fy / 1.8).fract();
+                                        if side {
+                                            kk *= if ly > 0.85 { 0.7 } else if (lx - 0.5).abs() < 0.08 { 1.15 } else { 1.0 - ly * 0.12 };
+                                        }
+                                    }
+                                    Rings => {
+                                        let r = ((fx - midf).powi(2) + (fy - rhf * 0.5).powi(2)).sqrt();
+                                        if side && r.rem_euclid(1.6) < 0.25 {
+                                            kk *= 0.72;
+                                        }
+                                    }
+                                    Robe => {
+                                        kk *= if (tx + ty) % 2 == 0 { 1.03 } else { 0.97 };
+                                        // Embroidery along the hems and down the front opening only.
+                                        let hem = fy > rhf - 0.7 && fy < rhf - 0.2;
+                                        let opening = piece == 1 && b == 0 && front && (fx - midf).abs() < 0.35;
+                                        if side && (hem || opening) {
+                                            col = fc(pal.trim);
+                                            kk = if (fx + fy).rem_euclid(1.0) < 0.5 { 1.05 } else { 0.9 };
+                                        }
+                                    }
+                                    Mail | Plain => {}
+
+                                }
+                                let o = ((ty as u32 * w + tx as u32) * 4) as usize;
+                                for c in 0..3 {
+                                    let v = (col[c] * kk).min(255.0);
+                                    pixels[o + c] = (v + (255.0 - v) * wh) as u8;
+                                }
+                                pixels[o + 3] = aa;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // The swatches the set's own pieces take, in the lower half.
+    crate::armor_design::paint_tiles(&pal, glint, &mut pixels, w, sc);
+    Skin { pixels, scale: sc }
+}
+
+/// An armour trim in one colour: a bright line along the rims of each plate and a chevron down
+/// the front, see-through everywhere else. It sits a hair over the armour.
+fn trim_skin(def: &MobDef, color: [u8; 3]) -> Skin {
+    let mut pixels = vec![0u8; (SKIN_W * SKIN_H * 4) as usize];
+    for piece in 0..4 {
+        for (_, _, size, uv, _) in armor_boxes(def, piece) {
+            let tex = (size.x as i32, size.y as i32, size.z as i32);
+            for (fi, f) in faces(Vec3::ZERO, size, uv, tex).iter().enumerate() {
+                let (rx, ry, rw, rh) = f.rect;
+                if fi >= 4 {
+                    continue;
+                }
+                for j in 0..rh {
+                    for i in 0..rw {
+                        let (x, y) = (rx + i, ry + j);
+                        if x < 0 || y < 0 || x >= 64 || y >= 64 {
+                            continue;
+                        }
+                        let rim = j == rh - 1 || (piece == 0 && j == 2);
+                        let mid = rw / 2;
+                        let chevron = fi == 0 && rw >= 4 && (j == (i - mid).abs() + 1 || j == (i - mid + 1).abs() + 1) && j < rh - 1;
+                        if !(rim || chevron) {
+                            continue;
+                        }
+                        let k = if (x + y) % 3 == 0 { 1.15 } else { 0.92 };
+                        let o = ((y * SKIN_W as i32 + x) * 4) as usize;
+                        for c in 0..3 {
+                            pixels[o + c] = (color[c] as f32 * k).min(255.0) as u8;
+                        }
+                        pixels[o + 3] = 255;
+                    }
+                }
+            }
+        }
+    }
+    Skin { pixels, scale: 1 }
+}
+
+fn armor_mesh(def: &MobDef, piece: usize, layer: u32, name: &str, color: [u8; 3]) -> (Vec<EntityVertex>, Vec<u32>) {
+    let (mut verts, mut indices) = armor_mesh_over(def, piece, layer, 0.0);
+    if def.parts.len() < 6 {
+        return (verts, indices);
+    }
+    // The set's own pieces (armor_design.rs): boxes placed freely, their faces cut from swatches.
+    let mut mb = MeshBuilder::new(layer, None);
+    for (k, p) in crate::armor_design::design(name, color).pieces.iter().enumerate().filter(|(_, p)| p.slot == piece) {
+        let (tx, ty) = p.tile.origin();
+        let h = p.half;
+        for axis in 0..3 {
+            for s in [-1.0f32, 1.0] {
+                // u runs across the face, v down it (along -Y on the sides).
+                let (ua, va) = match axis {
+                    0 => (2, 1),
+                    1 => (0, 2),
+                    _ => (0, 1),
+                };
+                let corner = |a: f32, c: f32| {
+                    let mut v = Vec3::ZERO;
+                    v[axis] = s * h[axis];
+                    v[ua] = a * h[ua];
+                    v[va] = c * h[va];
+                    p.place.transform_point3(v)
+                };
+                let down = if va == 1 { -1.0 } else { 1.0 };
+                let pts = [corner(-1.0, -down), corner(1.0, -down), corner(1.0, down), corner(-1.0, down)];
+                let (lu, lv) = (h[ua] * 2.0, h[va] * 2.0);
+                // Kept a pixel inside the swatch, so distant (mipmapped) faces don't take the
+                // colour of the swatch next door.
+                let (w, hh) = if p.tile.stretch() { (14.0, 14.0) } else { (lu.clamp(0.5, 14.0), lv.clamp(0.5, 14.0)) };
+                let seed = (k * 7 + axis * 3 + (s > 0.0) as usize) as f32;
+                let (ox, oy) = (tx + 1.0 + ((seed * 5.3) % (14.0 - w + 0.01)).max(0.0), ty + 1.0 + ((seed * 3.7) % (14.0 - hh + 0.01)).max(0.0));
+                let uv = |x: f32, y: f32| [x / SKIN_W as f32, y / SKIN_H as f32];
+                let uvs = [uv(ox, oy), uv(ox + w, oy), uv(ox + w, oy + hh), uv(ox, oy + hh)];
+                let mut n = Vec3::ZERO;
+                n[axis] = s;
+                let n = p.place.transform_vector3(n).normalize_or_zero();
+                let a = n.abs();
+                let shade = (a.x * 0.6 + a.z * 0.8 + a.y * if n.y > 0.0 { 1.0 } else { 0.5 }) / (a.x + a.y + a.z).max(1e-4);
+                mb.quad(pts, uvs, n, shade, p.part as u32);
+            }
+        }
+    }
+    let base = verts.len() as u32;
+    verts.extend(mb.verts);
+    indices.extend(mb.indices.into_iter().map(|i| i + base));
+    (verts, indices)
+}
+
+/// One armour piece as worn, for drawing its item icon (armor_icon.rs): the triangles (position,
+/// texture coordinate, face shade, body part) and the set's armour texture (RGBA, width, height).
+#[cfg(test)]
+pub(crate) fn armor_piece_model(def: &MobDef, name: &str, color: [u8; 3], piece: usize) -> (Vec<([f32; 3], [f32; 2], f32, usize)>, Vec<u32>, Vec<u8>, u32, u32) {
+    let (verts, idx) = armor_mesh(def, piece, 0, name, color);
+    let skin = armor_skin(def, name, color, SKIN_DETAIL);
+    let v = verts.iter().map(|v| (v.pos, v.uv, ((v.packed >> 4) & 255) as f32 / 255.0, (v.packed & 15) as usize)).collect();
+    (v, idx, skin.pixels, SKIN_W * SKIN_DETAIL, SKIN_H * SKIN_DETAIL)
+}
+
+fn armor_mesh_over(def: &MobDef, piece: usize, layer: u32, over: f32) -> (Vec<EntityVertex>, Vec<u32>) {
+    let mut mb = MeshBuilder::new(layer, Some(def));
+    for (part, origin, size, uv, inflate) in armor_boxes(def, piece) {
+        let inflate = inflate + over;
+        let tex = (size.x as i32, size.y as i32, size.z as i32);
+        for f in faces(origin - Vec3::splat(inflate), size + Vec3::splat(2.0 * inflate), uv, tex).iter() {
+            // Both sides, so an open sleeve or helmet still looks solid from inside.
+            mb.face(f, part as u32);
+        }
+    }
+    (mb.verts, mb.indices)
+}
+
+/// Both wings of a pair: the same thin box on the two wing bones, hanging from the shoulder
+/// blade and reaching out along +X (the left bone mirrors it).
+fn wing_mesh(layer: u32) -> (Vec<EntityVertex>, Vec<u32>) {
+    let mut mb = MeshBuilder::new(layer, None);
+    let (w, h) = crate::wings::WING_SIZE;
+    for part in [crate::wings::WING_R, crate::wings::WING_L] {
+        for f in faces(Vec3::new(0.0, -h + 6.0, -0.5), Vec3::new(w, h, 1.0), (0, 0), (w as i32, h as i32, 1)).iter() {
+            mb.face(f, part as u32);
+        }
+    }
+    (mb.verts, mb.indices)
+}
+
+/// A model built from painted boxes (instruments.rs, torch.rs): each face painted with its
+/// material's swatch, the grain running along the longer side.
+/// A gun (guns.rs): boxes like an instrument's, each face on the skin layer of its material's
+/// class (`layer0` + guns::layer_of).
+fn gun_mesh(model: Vec<crate::instruments::Piece>, layer0: u32) -> (Vec<EntityVertex>, Vec<u32>) {
+    let mut out_v = Vec::new();
+    let mut out_i = Vec::new();
+    for p in model {
+        for b in &p.boxes {
+            let one = vec![crate::instruments::Piece { part: p.part, place: p.place, boxes: vec![*b] }];
+            let (v, idx) = instrument_mesh(one, layer0 + crate::guns::layer_of(b.mat) as u32);
+            let base = out_v.len() as u32;
+            out_v.extend(v);
+            out_i.extend(idx.into_iter().map(|k| k + base));
+        }
+    }
+    (out_v, out_i)
+}
+
+fn instrument_mesh(model: Vec<crate::instruments::Piece>, layer: u32) -> (Vec<EntityVertex>, Vec<u32>) {
+    let mut mb = MeshBuilder::new(layer, None);
+    let light = Vec3::new(0.2, 0.6, 0.8).normalize();
+    for p in model {
+        for b in &p.boxes {
+            // Models with more than 32 materials (spells) spill onto the next skin layers.
+            mb.layer = layer + b.mat as u32 / 32;
+            for axis in 0..3 {
+                for s in [-1.0f32, 1.0] {
+                    let (t1, t2) = ((axis + 1) % 3, (axis + 2) % 3);
+                    let plane = if s > 0.0 { b.hi[axis] } else { b.lo[axis] };
+                    let corner = |a: f32, c: f32| {
+                        let mut v = Vec3::ZERO;
+                        v[axis] = plane;
+                        v[t1] = a;
+                        v[t2] = c;
+                        p.place.transform_point3(v)
+                    };
+                    let pts = [corner(b.lo[t1], b.lo[t2]), corner(b.hi[t1], b.lo[t2]), corner(b.hi[t1], b.hi[t2]), corner(b.lo[t1], b.hi[t2])];
+                    let (l1, l2) = (b.hi[t1] - b.lo[t1], b.hi[t2] - b.lo[t2]);
+                    let along = l1 >= l2;
+                    let (x, y, w, h) = if along { crate::instruments::swatch(b.mat % 32, l1, l2) } else { crate::instruments::swatch(b.mat % 32, l2, l1) };
+                    let uv = |u: f32, v: f32| [(x + u * w) / SKIN_W as f32, (y + v * h) / SKIN_H as f32];
+                    let uvs = if along { [uv(0.0, 0.0), uv(1.0, 0.0), uv(1.0, 1.0), uv(0.0, 1.0)] } else { [uv(0.0, 0.0), uv(0.0, 1.0), uv(1.0, 1.0), uv(1.0, 0.0)] };
+                    let mut n = Vec3::ZERO;
+                    n[axis] = s;
+                    let n = p.place.transform_vector3(n).normalize_or_zero();
+                    let shade = 0.6 + 0.4 * n.dot(light).max(0.0);
+                    mb.quad(pts, uvs, n, shade, p.part);
+                }
+            }
+        }
+    }
+    (mb.verts, mb.indices)
+}
+
+impl EntityRenderer {
+    /// `texture_res` is the texture resolution setting (pixels per block face): skins get one
+    /// texel per model pixel at 16, up to SKIN_DETAIL at 64 and above.
+    pub fn new(r: &Renderer, reg: &MobRegistry, paintings: &[PaintingDef], base: &Path, texture_res: u32) -> EntityRenderer {
+        let device = &r.device;
+        let scale = (texture_res / 16).clamp(1, SKIN_DETAIL).next_power_of_two();
+        let mut skins: Vec<Skin> = reg.defs.iter().map(|d| load_skin(base, d.skin.as_deref().unwrap_or(&d.name), scale)).collect();
+        let back = crate::paintings::back_pixels(base);
+        skins.extend(paintings.iter().map(|p| Skin { pixels: crate::paintings::skin_pixels(p, &back), scale: 1 }.rescaled(scale)));
+        let player = reg.id("player").map(|i| &reg.defs[i]);
+        let armor_layer0 = skins.len();
+        if let Some(pd) = player {
+            skins.extend(ARMOR_MATERIALS.iter().map(|(n, c)| armor_skin(pd, n, *c, scale)));
+        }
+        let trim_layer0 = skins.len();
+        if let Some(pd) = player {
+            skins.extend(crate::smithing::MATERIALS.iter().map(|m| trim_skin(pd, m.2).rescaled(scale)));
+        }
+        let wing_layer0 = skins.len();
+        for w in crate::wings::WINGS {
+            skins.push(Skin { pixels: crate::wings::paint(w, SKIN_DETAIL), scale: SKIN_DETAIL }.rescaled(scale));
+        }
+        let instrument_layer = skins.len();
+        let mut kit = crate::instruments::paint_skin(SKIN_DETAIL);
+        crate::torch::paint(&mut kit, SKIN_DETAIL);
+        skins.push(Skin { pixels: kit, scale: SKIN_DETAIL }.rescaled(scale));
+        let shield_layer = skins.len();
+        skins.push(Skin { pixels: crate::shield::paint_skin(SKIN_DETAIL), scale: SKIN_DETAIL }.rescaled(scale));
+        let summon_layer = skins.len();
+        skins.push(Skin { pixels: crate::summons::paint(SKIN_DETAIL), scale: SKIN_DETAIL }.rescaled(scale));
+        skins.push(Skin { pixels: crate::summons::paint2(SKIN_DETAIL), scale: SKIN_DETAIL }.rescaled(scale));
+        // Animal coats (variants.ron): one layer each after everything else.
+        let mut coat_layers = Vec::with_capacity(reg.defs.len());
+        for d in &reg.defs {
+            if d.variants.len() > 1 {
+                coat_layers.push(Some(skins.len() as u32));
+                for v in &d.variants[1..] {
+                    skins.push(load_skin(base, &v.skin, scale));
+                }
+            } else {
+                coat_layers.push(None);
+            }
+        }
+        let spell_layer = skins.len();
+        // Two pages of spell materials (32 swatches each); a box's page is its material / 32.
+        for page in 0..crate::spell_shapes::PAGES {
+            skins.push(Skin { pixels: crate::spell_shapes::paint(SKIN_DETAIL, page), scale: SKIN_DETAIL }.rescaled(scale));
+        }
+        // The guns (guns.rs): the same skin once per material class, so metal glints and wood
+        // stays matte on one gun.
+        let gun_layer0 = skins.len();
+        let gun_skin = Skin { pixels: crate::guns::paint_skin(SKIN_DETAIL), scale: SKIN_DETAIL }.rescaled(scale);
+        for _ in crate::guns::CLASSES {
+            skins.push(Skin { pixels: gun_skin.pixels.clone(), scale: gun_skin.scale });
+        }
+        let layers = skins.len().max(1) as u32;
+        let (tw, th) = (SKIN_W * scale, SKIN_H * scale);
+        let levels = scale.trailing_zeros() + 1;
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("mob skins"),
+            size: wgpu::Extent3d { width: tw, height: th, depth_or_array_layers: layers },
+            mip_level_count: levels,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // Mip levels down to one texel per model pixel, so detailed skins don't shimmer far away.
+        for (i, s) in skins.iter().enumerate() {
+            for (level, data) in crate::textures::mip_chain_rect(&s.pixels, tw, th, levels).iter().enumerate() {
+                let (lw, lh) = (tw >> level, th >> level);
+                r.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: level as u32, origin: wgpu::Origin3d { x: 0, y: 0, z: i as u32 }, aspect: wgpu::TextureAspect::All },
+                    data,
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(lw * 4), rows_per_image: Some(lh) },
+                    wgpu::Extent3d { width: lw, height: lh, depth_or_array_layers: 1 },
+                );
+            }
+        }
+        let view = tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        let skin_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mob skins"),
+            layout: &r.tex_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&r.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&view) },
+            ],
+        });
+        let storage = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let inst_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bones"),
+            entries: &[storage(0, wgpu::ShaderStages::VERTEX), storage(1, wgpu::ShaderStages::FRAGMENT)],
+        });
+        // The material class of every skin layer (material.rs): armour and trims shine, mobs don't.
+        let mut classes = vec![crate::material::NONE; layers as usize];
+        if player.is_some() {
+            for (i, (n, _)) in ARMOR_MATERIALS.iter().enumerate() {
+                // Bit 16: the bottom row of the armour's swatches glows (armor_design.rs).
+                classes[armor_layer0 + i] = crate::material::armor_class(n) | 0x10000;
+            }
+            for (i, m) in crate::smithing::MATERIALS.iter().enumerate() {
+                classes[trim_layer0 + i] = crate::material::trim_class(m.0);
+            }
+        }
+        // Bit 16: the gun skin's bottom row (embers, energy) glows.
+        for (k, c) in crate::guns::CLASSES.iter().enumerate() {
+            classes[gun_layer0 + k] = *c | 0x10000;
+        }
+        let mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("skin materials"), contents: bytemuck::cast_slice(&classes), usage: wgpu::BufferUsages::STORAGE });
+        let inst_cap = 64;
+        let inst_buf = Self::make_inst_buf(device, inst_cap);
+        let inst_bg = Self::make_inst_bg(device, &inst_layout, &inst_buf, &mat_buf);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("entity"),
+            source: wgpu::ShaderSource::Wgsl(format!("{}\n{}\n{}", include_str!("shaders/common.wgsl"), include_str!("shaders/material.wgsl"), include_str!("shaders/entity.wgsl")).into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("entity"),
+            bind_group_layouts: &[&r.globals_layout, &r.tex_layout, &inst_layout, &r.fx.layout],
+            push_constant_ranges: &[],
+        });
+        let vbuf_layout = [wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<EntityVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Uint32, 3 => Uint32],
+        }];
+        let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("entity shadow"),
+            bind_group_layouts: &[&r.globals_layout, &r.tex_layout, &inst_layout],
+            push_constant_ranges: &[],
+        });
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("entity shadow"),
+            layout: Some(&shadow_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_entity_shadow"), buffers: &vbuf_layout, compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_entity_shadow"), targets: &[], compilation_options: Default::default() }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: crate::scenefx::SHADOW_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                // No slope bias: the model's small faces turned edge-on to the sun would be pushed
+                // behind the ground; the lookup on the receiving side is offset instead.
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+        let make = |format: wgpu::TextureFormat| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("entity"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_entity"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<EntityVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Uint32, 3 => Uint32],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_entity"),
+                targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+        let pipelines = [make(r.config.format), make(crate::post::HDR)];
+        let mut meshes = Vec::new();
+        for (i, d) in reg.defs.iter().enumerate() {
+            let (v, idx) = build_mesh(d, &skins[i], i as u32);
+            log::info!("mob '{}': {} vertices ({} with relief layers)", d.name, v.len(), d.layers.len());
+            meshes.push(MobMesh {
+                vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mob verts"), contents: bytemuck::cast_slice(&v), usage: wgpu::BufferUsages::VERTEX }),
+                ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mob idx"), contents: bytemuck::cast_slice(&idx), usage: wgpu::BufferUsages::INDEX }),
+                indices: idx.len() as u32,
+            });
+        }
+        let mob_meshes = meshes.len();
+        for (i, p) in paintings.iter().enumerate() {
+            let (v, idx) = painting_mesh(p, (mob_meshes + i) as u32);
+            meshes.push(MobMesh {
+                vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("painting verts"), contents: bytemuck::cast_slice(&v), usage: wgpu::BufferUsages::VERTEX }),
+                ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("painting idx"), contents: bytemuck::cast_slice(&idx), usage: wgpu::BufferUsages::INDEX }),
+                indices: idx.len() as u32,
+            });
+        }
+        let armor_meshes = player.map(|pd| {
+            let first = meshes.len();
+            for m in 0..ARMOR_MATERIALS.len() {
+                for piece in 0..4 {
+                    let (v, idx) = armor_mesh(pd, piece, (armor_layer0 + m) as u32, ARMOR_MATERIALS[m].0, ARMOR_MATERIALS[m].1);
+                    meshes.push(MobMesh {
+                        vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("armor verts"), contents: bytemuck::cast_slice(&v), usage: wgpu::BufferUsages::VERTEX }),
+                        ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("armor idx"), contents: bytemuck::cast_slice(&idx), usage: wgpu::BufferUsages::INDEX }),
+                        indices: idx.len() as u32,
+                    });
+                }
+            }
+            first
+        });
+        let trim_meshes = player.map(|pd| {
+            let first = meshes.len();
+            for m in 0..crate::smithing::MATERIALS.len() {
+                for piece in 0..4 {
+                    let (v, idx) = armor_mesh_over(pd, piece, (trim_layer0 + m) as u32, 0.12);
+                    meshes.push(MobMesh {
+                        vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("trim verts"), contents: bytemuck::cast_slice(&v), usage: wgpu::BufferUsages::VERTEX }),
+                        ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("trim idx"), contents: bytemuck::cast_slice(&idx), usage: wgpu::BufferUsages::INDEX }),
+                        indices: idx.len() as u32,
+                    });
+                }
+            }
+            first
+        });
+        let instrument_meshes = meshes.len();
+        // The held torches right after the instruments, in the same skin.
+        let models = (0..crate::instruments::COUNT).map(crate::instruments::model).chain((0..crate::torch::COUNT).map(crate::torch::model));
+        for model in models {
+            let (v, idx) = instrument_mesh(model, instrument_layer as u32);
+            meshes.push(MobMesh {
+                vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("instrument verts"), contents: bytemuck::cast_slice(&v), usage: wgpu::BufferUsages::VERTEX }),
+                ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("instrument idx"), contents: bytemuck::cast_slice(&idx), usage: wgpu::BufferUsages::INDEX }),
+                indices: idx.len() as u32,
+            });
+        }
+        let summon_meshes = meshes.len();
+        for i in 0..crate::summons::COUNT {
+            let (v, idx) = instrument_mesh(crate::summons::model(i), (summon_layer + crate::summons::page(i)) as u32);
+            meshes.push(MobMesh {
+                vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("summon verts"), contents: bytemuck::cast_slice(&v), usage: wgpu::BufferUsages::VERTEX }),
+                ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("summon idx"), contents: bytemuck::cast_slice(&idx), usage: wgpu::BufferUsages::INDEX }),
+                indices: idx.len() as u32,
+            });
+        }
+        let spell_meshes = meshes.len();
+        for i in 0..crate::spell_shapes::COUNT {
+            let (v, idx) = instrument_mesh(crate::spell_shapes::model(i), spell_layer as u32);
+            meshes.push(MobMesh {
+                vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("spell verts"), contents: bytemuck::cast_slice(&v), usage: wgpu::BufferUsages::VERTEX }),
+                ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("spell idx"), contents: bytemuck::cast_slice(&idx), usage: wgpu::BufferUsages::INDEX }),
+                indices: idx.len() as u32,
+            });
+        }
+        let shield_meshes = meshes.len();
+        for model in crate::shield::models() {
+            let (v, idx) = instrument_mesh(model, shield_layer as u32);
+            meshes.push(MobMesh {
+                vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("shield verts"), contents: bytemuck::cast_slice(&v), usage: wgpu::BufferUsages::VERTEX }),
+                ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("shield idx"), contents: bytemuck::cast_slice(&idx), usage: wgpu::BufferUsages::INDEX }),
+                indices: idx.len() as u32,
+            });
+        }
+        let gun_meshes = meshes.len();
+        for i in 0..crate::guns::COUNT {
+            let (v, idx) = gun_mesh(crate::guns::model(i), gun_layer0 as u32);
+            meshes.push(MobMesh {
+                vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("gun verts"), contents: bytemuck::cast_slice(&v), usage: wgpu::BufferUsages::VERTEX }),
+                ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("gun idx"), contents: bytemuck::cast_slice(&idx), usage: wgpu::BufferUsages::INDEX }),
+                indices: idx.len() as u32,
+            });
+        }
+        let wing_meshes = meshes.len();
+        for k in 0..crate::wings::WINGS.len() {
+            let (v, idx) = wing_mesh((wing_layer0 + k) as u32);
+            meshes.push(MobMesh {
+                vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("wing verts"), contents: bytemuck::cast_slice(&v), usage: wgpu::BufferUsages::VERTEX }),
+                ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("wing idx"), contents: bytemuck::cast_slice(&idx), usage: wgpu::BufferUsages::INDEX }),
+                indices: idx.len() as u32,
+            });
+        }
+        let particles = crate::particles::ParticleGpu::new(r);
+        let items = crate::item_render::ItemGpu::new(r);
+        EntityRenderer { particles, items, pipelines, shadow_pipeline, skin_bg, inst_layout, inst_bg, inst_buf, inst_cap, mat_buf, meshes, mob_meshes, armor_meshes, trim_meshes, wing_meshes, instrument_meshes, shield_meshes, summon_meshes, spell_meshes, gun_meshes, coat_layers, draws: Vec::new(), shadow_draws: Vec::new(), instance_count: 0 }
+    }
+
+    /// Mesh index of an armour piece (0 helmet .. 3 boots) for the item named `item`.
+    pub fn armor_mesh(&self, item: &str, piece: usize) -> Option<usize> {
+        let first = self.armor_meshes?;
+        let m = ARMOR_MATERIALS.iter().position(|(n, _)| item.starts_with(&format!("{n}_")))?;
+        Some(first + m * 4 + piece.min(3))
+    }
+
+    /// Mesh index of the trim over an armour piece, by trim material.
+    pub fn trim_mesh(&self, material: usize, piece: usize) -> Option<usize> {
+        Some(self.trim_meshes? + material * 4 + piece.min(3))
+    }
+
+    /// Mesh index of wings `k` (wings.rs).
+    pub fn wing_mesh(&self, k: usize) -> Option<usize> {
+        (k < crate::wings::WINGS.len()).then_some(self.wing_meshes + k)
+    }
+
+    /// Mesh index of musical instrument `i`.
+    pub fn instrument_mesh(&self, i: usize) -> Option<usize> {
+        (i < crate::instruments::COUNT).then_some(self.instrument_meshes + i)
+    }
+
+    /// Mesh index of held torch model `i` (torch.rs).
+    pub fn torch_mesh(&self, i: usize) -> Option<usize> {
+        (i < crate::torch::COUNT).then_some(self.instrument_meshes + crate::instruments::COUNT + i)
+    }
+
+    /// Mesh index of shield mesh `i` (shield.rs: frames, cloth, designs).
+    pub fn shield_mesh(&self, i: usize) -> Option<usize> {
+        (i < crate::shield::MESHES).then_some(self.shield_meshes + i)
+    }
+
+    /// Mesh index of gun model `i` (guns.rs).
+    pub fn gun_mesh(&self, i: usize) -> Option<usize> {
+        (i < crate::guns::COUNT).then_some(self.gun_meshes + i)
+    }
+
+    /// Mesh index of summoned creature model `i` (summons.rs).
+    pub fn summon_mesh(&self, i: usize) -> Option<usize> {
+        (i < crate::summons::COUNT).then_some(self.summon_meshes + i)
+    }
+
+    /// Mesh index of spell shape `i` (spell_shapes.rs).
+    pub fn spell_mesh(&self, i: usize) -> Option<usize> {
+        (i < crate::spell_shapes::COUNT).then_some(self.spell_meshes + i)
+    }
+
+    /// Mesh index of a painting, for `prepare`.
+    pub fn painting_mesh(&self, i: usize) -> usize {
+        self.mob_meshes + i
+    }
+
+    fn make_inst_buf(device: &wgpu::Device, cap: usize) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bones"),
+            size: (cap * std::mem::size_of::<Bones>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    fn make_inst_bg(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, buf: &wgpu::Buffer, mats: &wgpu::Buffer) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bones"),
+            layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: mats.as_entire_binding() }],
+        })
+    }
+
+    /// Upload this frame's instances. `items` are (mob definition index, bones), any order.
+    #[allow(dead_code)]
+    pub fn prepare(&mut self, r: &Renderer, items: Vec<(usize, Bones)>) {
+        self.prepare_split(r, items, Vec::new(), Vec::new());
+    }
+
+    /// Like `prepare`, with `overlay` drawn but casting no shadow (the first-person arm, the
+    /// inventory figure) and `shadow_only` casting a shadow but not drawn (the player's body in
+    /// first person).
+    pub fn prepare_split(&mut self, r: &Renderer, mut items: Vec<(usize, Bones)>, mut overlay: Vec<(usize, Bones)>, mut shadow_only: Vec<(usize, Bones)>) {
+        items.sort_by_key(|(d, _)| *d);
+        overlay.sort_by_key(|(d, _)| *d);
+        shadow_only.sort_by_key(|(d, _)| *d);
+        let total = items.len() + overlay.len() + shadow_only.len();
+        self.instance_count = items.len() + overlay.len();
+        self.draws.clear();
+        self.shadow_draws.clear();
+        if total == 0 {
+            return;
+        }
+        if total > self.inst_cap {
+            self.inst_cap = total.next_power_of_two();
+            self.inst_buf = Self::make_inst_buf(&r.device, self.inst_cap);
+            self.inst_bg = Self::make_inst_bg(&r.device, &self.inst_layout, &self.inst_buf, &self.mat_buf);
+        }
+        // A coat number (Mobs::instances) becomes the layer to draw with, plus one (0 = the mesh's own).
+        let coat = |d: usize, b: &Bones| -> Bones {
+            let mut b = *b;
+            let v = b.bend[0][3];
+            if v >= 0.5 {
+                b.bend[0][3] = match self.coat_layers.get(d).copied().flatten() {
+                    Some(first) => (first + v.round() as u32) as f32,
+                    None => 0.0,
+                };
+            }
+            b
+        };
+        let bones: Vec<Bones> = items.iter().chain(&overlay).chain(&shadow_only).map(|(d, b)| coat(*d, b)).collect();
+        r.queue.write_buffer(&self.inst_buf, 0, bytemuck::cast_slice(&bones));
+        // Runs of the same mesh, each list after the ones before it in the buffer.
+        let meshes = self.meshes.len();
+        let runs = |list: &[(usize, Bones)], base: usize, out: &mut Vec<(usize, u32, u32)>| {
+            let mut start = 0usize;
+            while start < list.len() {
+                let d = list[start].0;
+                let mut end = start;
+                while end < list.len() && list[end].0 == d {
+                    end += 1;
+                }
+                if d < meshes {
+                    out.push((d, (base + start) as u32, (end - start) as u32));
+                }
+                start = end;
+            }
+        };
+        runs(&items, 0, &mut self.draws);
+        runs(&overlay, items.len(), &mut self.draws);
+        runs(&items, 0, &mut self.shadow_draws);
+        runs(&shadow_only, items.len() + overlay.len(), &mut self.shadow_draws);
+    }
+
+    /// `fx`: the shadow map bind group, so mobs stand in the shade of trees too.
+    pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, hdr: bool, block_tex: &'a wgpu::BindGroup, fx: &'a wgpu::BindGroup) {
+        self.particles.draw(pass, hdr, block_tex);
+        self.items.draw(pass, hdr, block_tex, fx);
+        if !self.draws.is_empty() {
+            pass.set_pipeline(&self.pipelines[hdr as usize]);
+            pass.set_bind_group(1, &self.skin_bg, &[]);
+            pass.set_bind_group(2, &self.inst_bg, &[]);
+            pass.set_bind_group(3, fx, &[]);
+            self.draw_list(pass, &self.draws);
+        }
+        self.items.draw_halos(pass, hdr, block_tex, fx);
+    }
+
+    /// Into the sun's shadow map (the pass has the globals bound).
+    pub fn draw_shadow<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        if self.shadow_draws.is_empty() {
+            return;
+        }
+        pass.set_pipeline(&self.shadow_pipeline);
+        pass.set_bind_group(1, &self.skin_bg, &[]);
+        pass.set_bind_group(2, &self.inst_bg, &[]);
+        self.draw_list(pass, &self.shadow_draws);
+    }
+
+    fn draw_list<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, list: &[(usize, u32, u32)]) {
+        for &(m, first, count) in list {
+            let mesh = &self.meshes[m];
+            pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
+            pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.indices, 0, first..first + count);
+        }
+    }
+}

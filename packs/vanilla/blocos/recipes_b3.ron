@@ -1,0 +1,12 @@
+// Lote B3 of the block review (plan/blocos-analise.md). Made by tools/gen_blocos_b3.py:
+// edit it and run it again.
+(
+    shapeless: [
+        (ingredients: ["lilac"], result: "magenta_dye", count: 2),
+        (ingredients: ["peony"], result: "pink_dye", count: 2),
+        (ingredients: ["rose_bush"], result: "red_dye", count: 2),
+        (ingredients: ["wither_rose"], result: "black_dye", count: 1),
+        (ingredients: ["cactus_flower"], result: "pink_dye", count: 1),
+        (ingredients: ["wildflowers"], result: "yellow_dye", count: 1),
+    ],
+)

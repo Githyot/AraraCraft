@@ -1,0 +1,1017 @@
+//! Procedural sound effects. No sound files: every sound is built from filtered noise and a few
+//! decaying tones. They are kept low and soft on purpose (thumps, crunches, knocks) like the
+//! classic game, because bright, high-pitched effects get tiring to hear thousands of times.
+
+use crate::audio::{Material, Sfx};
+
+const RATE: f32 = 44100.0;
+const TAU: f32 = std::f32::consts::TAU;
+
+struct Rng(u32);
+
+impl Rng {
+    fn next(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        self.0 as f32 / u32::MAX as f32
+    }
+    fn noise(&mut self) -> f32 {
+        self.next() * 2.0 - 1.0
+    }
+    fn range(&mut self, a: f32, b: f32) -> f32 {
+        a + (b - a) * self.next()
+    }
+}
+
+/// Two one-pole low-pass filters in a row: a gentle 12 dB/octave roll-off.
+struct LowPass {
+    a: f32,
+    y1: f32,
+    y2: f32,
+}
+
+impl LowPass {
+    fn new(cutoff: f32) -> LowPass {
+        LowPass { a: coef(cutoff), y1: 0.0, y2: 0.0 }
+    }
+    fn set(&mut self, cutoff: f32) {
+        self.a = coef(cutoff);
+    }
+    fn run(&mut self, x: f32) -> f32 {
+        self.y1 += self.a * (x - self.y1);
+        self.y2 += self.a * (self.y1 - self.y2);
+        self.y2
+    }
+}
+
+fn coef(cutoff: f32) -> f32 {
+    1.0 - (-TAU * cutoff / RATE).exp()
+}
+
+/// How a material sounds: noise colour, body resonances, and how gritty it is.
+struct Voice {
+    cutoff: f32,
+    /// Resonant body modes (Hz) and their loudness.
+    body: &'static [(f32, f32)],
+    body_decay: f32,
+    /// Grains per second in the crunchy tail.
+    grains: f32,
+    grain_len: f32,
+    noise_gain: f32,
+}
+
+fn voice(m: Material) -> Voice {
+    match m.base() {
+        // A dull clack with some grit.
+        Material::Stone => Voice { cutoff: 1300.0, body: &[(118.0, 0.5), (182.0, 0.35), (265.0, 0.2)], body_decay: 0.045, grains: 70.0, grain_len: 0.006, noise_gain: 0.9 },
+        // A hollow knock.
+        Material::Wood => Voice { cutoff: 750.0, body: &[(92.0, 0.7), (184.0, 0.45), (276.0, 0.2)], body_decay: 0.08, grains: 25.0, grain_len: 0.01, noise_gain: 0.6 },
+        // Soft crunch of dirt and roots.
+        Material::Grass => Voice { cutoff: 950.0, body: &[(70.0, 0.35)], body_decay: 0.05, grains: 120.0, grain_len: 0.008, noise_gain: 1.0 },
+        // Fine, dense crunch.
+        Material::Sand => Voice { cutoff: 1500.0, body: &[(60.0, 0.25)], body_decay: 0.04, grains: 260.0, grain_len: 0.004, noise_gain: 0.85 },
+        // Glass keeps a little shine, but low and short.
+        Material::Glass => Voice { cutoff: 2100.0, body: &[(105.0, 0.4), (940.0, 0.12), (1230.0, 0.08)], body_decay: 0.07, grains: 60.0, grain_len: 0.005, noise_gain: 0.6 },
+        // Muffled.
+        Material::Cloth => Voice { cutoff: 380.0, body: &[(65.0, 0.2)], body_decay: 0.05, grains: 40.0, grain_len: 0.02, noise_gain: 1.0 },
+        // Damp, soft thud with a little grit.
+        Material::Dirt => Voice { cutoff: 620.0, body: &[(58.0, 0.45), (96.0, 0.2)], body_decay: 0.06, grains: 80.0, grain_len: 0.012, noise_gain: 0.95 },
+        // Loose stones rolling against each other.
+        Material::Gravel => Voice { cutoff: 1100.0, body: &[(85.0, 0.3), (150.0, 0.2)], body_decay: 0.03, grains: 180.0, grain_len: 0.009, noise_gain: 1.0 },
+        // A leafy rustle, airy and low.
+        Material::Leaves => Voice { cutoff: 800.0, body: &[(52.0, 0.15)], body_decay: 0.03, grains: 220.0, grain_len: 0.014, noise_gain: 0.8 },
+        // Packed-snow squeak, kept low and soft.
+        Material::Snow => Voice { cutoff: 700.0, body: &[(62.0, 0.2)], body_decay: 0.04, grains: 150.0, grain_len: 0.018, noise_gain: 0.85 },
+        // A deep clank that rings a moment.
+        Material::Metal => Voice { cutoff: 1000.0, body: &[(110.0, 0.6), (233.0, 0.35), (347.0, 0.2)], body_decay: 0.16, grains: 20.0, grain_len: 0.006, noise_gain: 0.5 },
+        // Stone with crystals in it: a heavier clack and extra grit.
+        Material::Ore => Voice { cutoff: 1250.0, body: &[(100.0, 0.55), (160.0, 0.4), (240.0, 0.25)], body_decay: 0.06, grains: 110.0, grain_len: 0.005, noise_gain: 0.95 },
+        _ => voice(Material::Stone),
+    }
+}
+
+/// A recording if there is one, otherwise the synthesized stand-in.
+fn recorded(v: Vec<f32>, otherwise: impl FnOnce() -> Vec<f32>) -> Vec<f32> {
+    if v.len() > 64 {
+        v
+    } else {
+        otherwise()
+    }
+}
+
+pub fn synth(sfx: Sfx, seed: u32) -> Vec<f32> {
+    let mut rng = Rng(seed.wrapping_mul(747796405).wrapping_add(2891336453) | 1);
+    let out = match sfx {
+        // Blocks, footsteps, blows, voices and swings are real recordings (block_sounds.rs,
+        // hit_sounds.rs, swing_sounds.rs); the old synthesized voices stay only as a fallback.
+        Sfx::Break(m) => recorded(crate::block_sounds::block(m, crate::block_sounds::Action::Break, seed), || block(m.base(), &mut rng, 0.38, 1.0, 0.22, 0.95)),
+        Sfx::Place(m) => recorded(crate::block_sounds::block(m, crate::block_sounds::Action::Place, seed), || block(m.base(), &mut rng, 0.16, 1.0, 0.03, 0.8)),
+        Sfx::Hit(m) => recorded(crate::block_sounds::block(m, crate::block_sounds::Action::Hit, seed), || block(m.base(), &mut rng, 0.11, 0.6, 0.04, 0.45)),
+        Sfx::Step(m) => recorded(crate::block_sounds::block(m, crate::block_sounds::Action::Step, seed), || block(m.base(), &mut rng, 0.13, 0.35, 0.08, 0.3)),
+        Sfx::Run(m) => recorded(crate::block_sounds::block(m, crate::block_sounds::Action::Run, seed), || block(m.base(), &mut rng, 0.13, 0.45, 0.08, 0.4)),
+        Sfx::Sneak(m) => recorded(crate::block_sounds::block(m, crate::block_sounds::Action::Sneak, seed), || block(m.base(), &mut rng, 0.13, 0.2, 0.08, 0.15)),
+        Sfx::Swing(w, speed) => crate::swing_sounds::swing(w, speed, crate::swing_sounds::last_heft(), seed),
+        Sfx::ToolUse(t, m) => crate::swing_sounds::tool_use(t, m, seed),
+        Sfx::Impact(b, k) => crate::hit_sounds::impact(b, k, seed),
+        Sfx::Voice(who, cry) => crate::hit_sounds::voice(who, cry, seed),
+        Sfx::Click => click(&mut rng),
+        Sfx::Hurt => recorded(crate::hit_sounds::player_hurt(seed), || hurt(&mut rng)),
+        Sfx::Death => recorded(crate::hit_sounds::player_death(seed), || death(&mut rng)),
+        Sfx::Respawn => respawn(),
+        Sfx::MobHit => recorded(crate::hit_sounds::impact(crate::hit_sounds::Body::Flesh, 110, seed), || mob_hit(&mut rng)),
+        Sfx::Explode => explode(&mut rng),
+        Sfx::Splash(s) => splash(&mut rng, s.clamp(0.2, 1.0)),
+        Sfx::Swim => swim(&mut rng),
+        Sfx::WaterExit => drips(&mut rng, 0.7, 5),
+        Sfx::Bubbles => drips(&mut rng, 0.6, 4),
+        Sfx::Pickup => pickup(&mut rng),
+        Sfx::Xp => xp(&mut rng),
+        Sfx::Eat => eat(&mut rng),
+        Sfx::Gulp => gulp(&mut rng),
+        Sfx::Uncork => uncork(&mut rng),
+        Sfx::PotionBreak => potion_break(&mut rng),
+        Sfx::Fizz => fizz(&mut rng),
+        Sfx::Thunder(c) => thunder(&mut rng, c.clamp(0.0, 1.0)),
+        Sfx::Rain => rain(&mut rng),
+        Sfx::Cast(k) => cast(&mut rng, k, false),
+        Sfx::SpellHit(k) => cast(&mut rng, k, true),
+        Sfx::Spell(k, hit) => spell(&mut rng, k, hit),
+        Sfx::Piston(out) => piston(&mut rng, out),
+        Sfx::Portal => portal(&mut rng),
+        Sfx::Melody(i, t) => melody(&mut rng, i, t),
+        Sfx::Fx(fx) => crate::sfx_extra::synth(fx, seed),
+        Sfx::Engine(k, t) => engine(&mut rng, k, t),
+        Sfx::Tune(i, t) => crate::mods::melodies::synth_tune(i, t, seed),
+        Sfx::Riff(i, k) => crate::mods::melodies::synth_riff(i, k, seed),
+        Sfx::Note(p, i) => note_block(&mut rng, p, i),
+    };
+    out.into_iter().map(|s| s.clamp(-1.0, 1.0)).collect()
+}
+
+/// A block sound: an impact (body modes + noise burst) followed by a crunchy tail of grains.
+fn block(m: Material, rng: &mut Rng, dur: f32, impact: f32, tail: f32, gain: f32) -> Vec<f32> {
+    let v = voice(m);
+    // Every sound is a little different, as if hit in a different spot.
+    let pitch = rng.range(0.86, 1.1);
+    let n = (dur * RATE) as usize;
+    // Grain start times and strengths.
+    let count = (v.grains * tail).round() as usize + 1;
+    let mut grains: Vec<(usize, f32, usize)> = (0..count)
+        .map(|_| {
+            let t = rng.next().powf(1.6) * tail;
+            let len = (v.grain_len * rng.range(0.6, 1.5) * RATE) as usize + 8;
+            ((t * RATE) as usize, rng.range(0.3, 1.0) * (1.0 - t / (tail + 0.05)), len)
+        })
+        .collect();
+    grains.sort_by_key(|g| g.0);
+    let mut lp = LowPass::new(v.cutoff * pitch);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = i as f32 / RATE;
+        // Impact: a 25 ms burst.
+        let mut e = impact * (-t / 0.012).exp();
+        for &(start, amp, len) in &grains {
+            if start > i {
+                break;
+            }
+            let k = i - start;
+            if k < len {
+                let x = k as f32 / len as f32;
+                e += amp * (x * std::f32::consts::PI).sin() * 0.6;
+            }
+        }
+        let noise = lp.run(rng.noise() * e) * v.noise_gain * 2.2;
+        let mut body = 0.0;
+        for &(f, a) in v.body {
+            body += (t * f * pitch * TAU).sin() * a * (-t / v.body_decay).exp() * impact;
+        }
+        // Fade the very end so nothing clicks.
+        let fade = ((dur - t) / 0.01).clamp(0.0, 1.0);
+        out.push((noise + body) * gain * fade);
+    }
+    out
+}
+
+/// Menu click: a soft, low wooden tick.
+fn click(rng: &mut Rng) -> Vec<f32> {
+    let n = (0.05 * RATE) as usize;
+    let mut lp = LowPass::new(900.0);
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            let e = (-t / 0.008).exp();
+            ((t * 430.0 * TAU).sin() * 0.5 + lp.run(rng.noise()) * 0.8) * e * 0.45
+        })
+        .collect()
+}
+
+/// Two-pole resonator: rings at one frequency, like a vowel formant.
+struct Resonator {
+    b1: f32,
+    b2: f32,
+    y1: f32,
+    y2: f32,
+    gain: f32,
+}
+
+impl Resonator {
+    fn new(freq: f32, bandwidth: f32) -> Resonator {
+        let r = (-std::f32::consts::PI * bandwidth / RATE).exp();
+        let b1 = 2.0 * r * (TAU * freq / RATE).cos();
+        Resonator { b1, b2: -r * r, y1: 0.0, y2: 0.0, gain: 1.0 - r }
+    }
+    fn run(&mut self, x: f32) -> f32 {
+        let y = x * self.gain + self.b1 * self.y1 + self.b2 * self.y2;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+}
+
+/// Getting hurt: a short voiced grunt, between the classic "oof" and Terraria's punchier
+/// yelp. A breathy push, then a low "uh" vowel whose pitch drops, every one a little different.
+fn hurt(rng: &mut Rng) -> Vec<f32> {
+    let dur = 0.3;
+    let n = (dur * RATE) as usize;
+    let base = rng.range(118.0, 142.0);
+    let vowel = rng.range(0.92, 1.08);
+    let mut f1 = Resonator::new(560.0 * vowel, 110.0);
+    let mut f2 = Resonator::new(980.0 * vowel, 160.0);
+    let mut f0 = Resonator::new(base * 2.0, 90.0);
+    let mut breath_lp = LowPass::new(1100.0);
+    let mut phase = 0.0f32;
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            let k = t / dur;
+            // Pitch kicks up for the punch, then falls away.
+            let pitch = base * (1.0 + 0.18 * (-t / 0.03).exp()) * (1.0 - 0.32 * k);
+            phase += pitch / RATE;
+            // Glottal pulse: a sharp click once per period, rich in low harmonics.
+            let p = phase.fract();
+            let pulse = (1.0 - p).powf(6.0) - 0.14;
+            let breath = breath_lp.run(rng.noise()) * (-t / 0.05).exp() * 0.5;
+            let src = pulse + breath;
+            let voiced = f1.run(src) * 1.5 + f2.run(src) * 0.5 + f0.run(src) * 0.8;
+            let env = (t / 0.012).min(1.0) * (1.0 - k).powf(1.8);
+            (voiced * env * 2.2).clamp(-1.0, 1.0)
+        })
+        .collect()
+}
+
+/// Dying: a long falling groan, then the body hitting the ground.
+fn death(rng: &mut Rng) -> Vec<f32> {
+    let dur = 1.5;
+    let n = (dur * RATE) as usize;
+    let mut phase = 0.0f32;
+    let mut voice = LowPass::new(650.0);
+    let mut thud = LowPass::new(160.0);
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            // The groan: 140 Hz sliding down to 55 Hz over the first second.
+            let k = (t / 1.0).min(1.0);
+            phase += (140.0 - 85.0 * k.powf(0.7)) / RATE;
+            let saw = (phase.fract() * 2.0 - 1.0) * 0.5 + (phase * TAU).sin() * 0.6;
+            let groan = voice.run(saw) * (t * 20.0).min(1.0) * (1.0 - k).powf(1.2) * 1.2;
+            // The fall at 0.75 s: a deep thump with a little dirt noise.
+            let dt = t - 0.75;
+            let body = if dt >= 0.0 { thud.run(rng.noise()) * 5.0 * (-dt / 0.12).exp() + (dt * 55.0 * TAU).sin() * 0.7 * (-dt / 0.18).exp() } else { thud.run(0.0) };
+            groan + body
+        })
+        .collect()
+}
+
+/// Respawning: a soft, warm chord that swells in and fades.
+fn respawn() -> Vec<f32> {
+    let dur = 1.8;
+    let n = (dur * RATE) as usize;
+    let notes = [(98.0, 0.5), (147.0, 0.4), (196.0, 0.3), (247.0, 0.15)];
+    let mut lp = LowPass::new(800.0);
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            let vib = 1.0 + (t * 5.0 * TAU).sin() * 0.003;
+            let mut x = 0.0;
+            for (j, (f, a)) in notes.iter().enumerate() {
+                // The notes come in one after another, from the bottom.
+                let start = j as f32 * 0.12;
+                if t > start {
+                    let e = ((t - start) / 0.35).min(1.0) * (1.0 - (t - start) / (dur - start)).max(0.0).powf(1.4);
+                    x += (f * vib * t * TAU).sin() * a * e;
+                }
+            }
+            lp.run(x) * 0.9
+        })
+        .collect()
+}
+
+/// A soft, low pop for picking something up.
+fn pickup(rng: &mut Rng) -> Vec<f32> {
+    let dur = 0.12;
+    let n = (dur * RATE) as usize;
+    let f0 = rng.range(150.0, 190.0);
+    let mut phase = 0.0f32;
+    let mut lp = LowPass::new(600.0);
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            // A quick rise in pitch, like a cork.
+            phase += (f0 * (1.0 + t * 6.0)) / RATE;
+            let e = (t / 0.006).min(1.0) * (-t / 0.035).exp();
+            lp.run((phase * TAU).sin() * e) * 0.8
+        })
+        .collect()
+}
+
+/// Experience: a short, warm two-note chime, kept low.
+fn xp(rng: &mut Rng) -> Vec<f32> {
+    let dur = 0.45;
+    let n = (dur * RATE) as usize;
+    let k = rng.range(0.95, 1.08);
+    let notes = [(220.0 * k, 0.45, 0.0), (330.0 * k, 0.3, 0.06)];
+    let mut lp = LowPass::new(700.0);
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            let mut x = 0.0;
+            for (f, a, start) in notes {
+                if t > start {
+                    let u = t - start;
+                    x += (f * u * TAU).sin() * a * (u / 0.01).min(1.0) * (-u / 0.12).exp();
+                }
+            }
+            lp.run(x) * 0.8
+        })
+        .collect()
+}
+
+/// A bite: a short, dull crunch.
+fn eat(rng: &mut Rng) -> Vec<f32> {
+    let dur = 0.16;
+    let n = (dur * RATE) as usize;
+    let mut lp = LowPass::new(rng.range(650.0, 850.0));
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            // Two or three crunches in quick succession.
+            let e = (-t / 0.03).exp() + 0.6 * (-((t - 0.06).max(0.0)) / 0.025).exp() * if t > 0.06 { 1.0 } else { 0.0 };
+            lp.run(rng.noise() * e) * 1.4
+        })
+        .collect()
+}
+
+/// One swallow: the liquid runs out of the neck in a couple of low glugs (air bubbles going back
+/// into the bottle, the deep ones), then the throat closes with a soft thump. Kept deep and wet,
+/// like a real drink heard from inside the head, never a bright "bloop".
+fn gulp(rng: &mut Rng) -> Vec<f32> {
+    let dur = 0.34;
+    let n = (dur * RATE) as usize;
+    let mut out = vec![0.0; n];
+    // The wash of liquid: dark noise that swells and fades.
+    let mut lp = LowPass::new(rng.range(380.0, 460.0));
+    for (i, s) in out.iter_mut().enumerate() {
+        let t = i as f32 / RATE;
+        let e = (t / 0.04).min(1.0) * (-t / 0.11).exp();
+        *s = lp.run(rng.noise()) * e * 0.9;
+    }
+    // Glugs: big bubbles, so low notes (Minnaert: bigger bubble, lower pitch).
+    let glugs = 2 + (rng.next() * 2.0) as usize;
+    for k in 0..glugs {
+        let start = ((0.02 + k as f32 * rng.range(0.05, 0.08)) * RATE) as usize;
+        bubble(&mut out, start, rng.range(150.0, 240.0), rng.range(0.22, 0.32), rng.range(0.05, 0.08));
+    }
+    // The swallow: a short low thump near the end.
+    let at = rng.range(0.2, 0.25);
+    let f = rng.range(70.0, 90.0);
+    for (i, s) in out.iter_mut().enumerate() {
+        let t = i as f32 / RATE - at;
+        if t > 0.0 {
+            *s += (t * f * TAU).sin() * (-t / 0.035).exp() * (t * 900.0).min(1.0) * 0.45;
+        }
+    }
+    out
+}
+
+/// A cork coming out: a dull "tok" (the air rushing into the neck) and a breath of air.
+fn uncork(rng: &mut Rng) -> Vec<f32> {
+    let dur = 0.14;
+    let n = (dur * RATE) as usize;
+    let f = rng.range(240.0, 300.0);
+    let mut lp = LowPass::new(900.0);
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            // The neck rings briefly as a tube: a falling note.
+            let tone = (t * f * (1.0 - t * 1.5) * TAU).sin() * (-t / 0.025).exp() * (t * 3000.0).min(1.0);
+            let air = lp.run(rng.noise()) * (-t / 0.04).exp() * 0.35;
+            (tone * 0.6 + air) * 0.9
+        })
+        .collect()
+}
+
+/// A thrown potion bursting: a thick glass crack, small shards tinkling low and soft, and the
+/// liquid slapping out.
+fn potion_break(rng: &mut Rng) -> Vec<f32> {
+    let mut out = block(Material::Glass, rng, 0.42, 1.0, 0.18, 0.9);
+    let mut lp = LowPass::new(1000.0);
+    for (i, s) in out.iter_mut().enumerate() {
+        let t = i as f32 / RATE;
+        let e = (t * 400.0).min(1.0) * (-t / 0.09).exp();
+        *s += lp.run(rng.noise()) * e * 0.9;
+    }
+    for _ in 0..5 {
+        let start = (rng.range(0.03, 0.25) * RATE) as usize;
+        bubble(&mut out, start, rng.range(220.0, 420.0), rng.range(0.06, 0.12), rng.range(0.03, 0.05));
+    }
+    out
+}
+
+/// A punch landing on a mob.
+fn mob_hit(rng: &mut Rng) -> Vec<f32> {
+    let dur = 0.16;
+    let n = (dur * RATE) as usize;
+    let mut lp = LowPass::new(700.0);
+    let mut phase = 0.0f32;
+    (0..n)
+        .map(|i| {
+            let k = i as f32 / n as f32;
+            phase += (110.0 - 50.0 * k) / RATE;
+            (lp.run(rng.noise()) * 1.4 + (phase * TAU).sin() * 0.6) * (1.0 - k).powi(3) * 0.8
+        })
+        .collect()
+}
+
+/// Deep rumbling noise with a crack at the start.
+fn explode(rng: &mut Rng) -> Vec<f32> {
+    let dur = 1.5;
+    let n = (dur * RATE) as usize;
+    let mut low = LowPass::new(140.0);
+    let mut mid = LowPass::new(1200.0);
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            let k = t / dur;
+            let x = rng.noise();
+            let crack = if t < 0.06 { mid.run(x) * (1.0 - t / 0.06) * 1.2 } else { 0.0 };
+            (low.run(x) * 7.0 + crack) * (1.0 - k).powf(2.2)
+        })
+        .collect()
+}
+
+/// A short soft hiss, like a hot stone dropped in water.
+fn fizz(rng: &mut Rng) -> Vec<f32> {
+    let dur = 0.6;
+    let n = (dur * RATE) as usize;
+    let mut lp = LowPass::new(900.0);
+    let mut low = LowPass::new(200.0);
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            let x = rng.noise();
+            let hiss = lp.run(x) - low.run(x);
+            hiss * 0.9 * (t * 60.0).min(1.0) * (1.0 - t / dur).powf(1.5)
+        })
+        .collect()
+}
+
+/// A piston: a short wooden scrape that ends in a dull knock (lower going back in).
+fn piston(rng: &mut Rng, out: bool) -> Vec<f32> {
+    let dur = 0.3;
+    let n = (dur * RATE) as usize;
+    let pitch = if out { 1.0 } else { 0.8 };
+    let mut lp = LowPass::new(500.0 * pitch);
+    let mut low = LowPass::new(90.0);
+    let hit = 0.14;
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            let x = rng.noise();
+            let scrape = (lp.run(x) - low.run(x)) * (t / hit).min(1.0) * if t < hit { 0.7 } else { 0.7 * (-(t - hit) / 0.03).exp() };
+            let knock = if t >= hit {
+                let k = t - hit;
+                (k * (95.0 - 30.0 * k / dur) * pitch * TAU).sin() * (-k / 0.05).exp() * 0.9
+            } else {
+                0.0
+            };
+            (scrape + knock) * 0.6
+        })
+        .collect()
+}
+
+/// A portal: two deep detuned notes that waver against each other, with a dark breath of
+/// noise swelling and fading under them.
+/// Short tunes of our own, as (scale step, beats); step 99 is a rest. The scale is D minor
+/// pentatonic from D3 up, so even the highest notes stay low and warm.
+const TUNES: [&[(i32, f32)]; 4] = [
+    &[(0, 1.0), (2, 1.0), (3, 1.0), (4, 2.0), (3, 1.0), (2, 1.0), (0, 2.0), (99, 1.0), (1, 1.0), (2, 1.0), (4, 1.0), (5, 2.0), (4, 1.0), (2, 1.0), (0, 3.0)],
+    &[(4, 1.5), (3, 0.5), (2, 1.0), (0, 1.0), (2, 2.0), (99, 0.5), (3, 1.5), (2, 0.5), (1, 1.0), (-1, 1.0), (0, 3.0)],
+    &[(0, 0.5), (0, 0.5), (2, 1.0), (4, 1.0), (2, 1.0), (5, 1.0), (4, 2.0), (99, 1.0), (3, 0.5), (3, 0.5), (2, 1.0), (1, 1.0), (0, 1.0), (-2, 1.0), (0, 3.0)],
+    &[(5, 2.0), (4, 1.0), (2, 1.0), (3, 2.0), (2, 1.0), (0, 1.0), (1, 2.0), (-1, 1.0), (0, 3.0)],
+];
+
+/// One note of a note block. Two octaves from F#2 up: an octave lower than the classic game,
+/// so the top notes stay warm. A plucked string (Karplus-Strong, so it rings like a real one),
+/// a soft low drum, a hollow wooden knock or a deep plucked bass.
+fn note_block(rng: &mut Rng, pitch: u8, inst: u8) -> Vec<f32> {
+    let f = 92.5 * 2f32.powf(pitch.min(24) as f32 / 12.0);
+    let len = (RATE * if inst == 1 || inst == 2 { 0.6 } else { 1.6 }) as usize;
+    let mut out = vec![0.0f32; len];
+    match inst {
+        1 | 2 => {
+            // A struck skin or block: a pitched body that drops a little, under a short thud.
+            let mut lp = LowPass::new(if inst == 1 { 500.0 } else { 900.0 });
+            let mut ph = 0.0f32;
+            let decay = if inst == 1 { 9.0 } else { 16.0 };
+            for (k, o) in out.iter_mut().enumerate() {
+                let t = k as f32 / RATE;
+                let bend = 1.0 + 0.25 * (-t * 30.0).exp();
+                ph += TAU * f * if inst == 1 { 0.5 } else { 1.0 } * bend / RATE;
+                let body = ph.sin() * (-t * decay).exp();
+                let thud = rng.noise() * (-t * 60.0).exp() * 0.5;
+                *o = lp.run(body + thud) * 0.8;
+            }
+        }
+        _ => {
+            let f = if inst == 3 { f * 0.5 } else { f };
+            let n = (RATE / f) as usize;
+            let mut buf: Vec<f32> = (0..n.max(2)).map(|_| rng.noise() * 0.6).collect();
+            let mut lp = LowPass::new(if inst == 3 { 600.0 } else { 1000.0 });
+            for (k, o) in out.iter_mut().enumerate() {
+                let i = k % buf.len();
+                let j = (k + 1) % buf.len();
+                let v = (buf[i] + buf[j]) * 0.4985;
+                buf[i] = v;
+                *o = lp.run(v) * 0.9;
+            }
+        }
+    }
+    out
+}
+
+fn note_freq(step: i32) -> f32 {
+    const PENTA: [f32; 5] = [0.0, 3.0, 5.0, 7.0, 10.0];
+    let oct = step.div_euclid(5);
+    let semis = PENTA[step.rem_euclid(5) as usize] + 12.0 * oct as f32;
+    146.83 * 2f32.powf(semis / 12.0)
+}
+
+fn melody(rng: &mut Rng, instrument: u8, tune: u8) -> Vec<f32> {
+    let notes = TUNES[tune as usize % TUNES.len()];
+    let beat = if instrument == 2 { 0.42 } else { 0.32 };
+    let total: f32 = notes.iter().map(|n| n.1).sum::<f32>() * beat + 1.5;
+    let mut out = vec![0.0f32; (total * RATE) as usize];
+    let mut t0 = 0.0;
+    for &(step, beats) in notes {
+        let dur = beats * beat;
+        if step != 99 {
+            // The cello plays an octave down.
+            let f = note_freq(step) * if instrument == 2 { 0.5 } else { 1.0 };
+            let start = (t0 * RATE) as usize;
+            let len = ((dur + if instrument == 0 { 1.2 } else { 0.15 }) * RATE) as usize;
+            let mut lp = LowPass::new(match instrument {
+                0 => 1100.0,
+                1 => 900.0,
+                _ => 800.0,
+            });
+            match instrument {
+                0 => {
+                    // Lute: a plucked string (Karplus-Strong), softened.
+                    let n = (RATE / f) as usize;
+                    let mut buf: Vec<f32> = (0..n.max(2)).map(|_| rng.noise() * 0.6).collect();
+                    for k in 0..len {
+                        let i = k % buf.len();
+                        let j = (k + 1) % buf.len();
+                        let v = (buf[i] + buf[j]) * 0.4985;
+                        buf[i] = v;
+                        if let Some(o) = out.get_mut(start + k) {
+                            *o += lp.run(v) * 0.9;
+                        }
+                    }
+                }
+                _ => {
+                    // Flute and cello: a held tone with a soft attack, vibrato and a bit of
+                    // breath (flute) or bow (cello).
+                    let mut ph = 0.0f32;
+                    for k in 0..len {
+                        let t = k as f32 / RATE;
+                        let env = (t / 0.08).min(1.0) * (((dur + 0.15) - t) / 0.15).clamp(0.0, 1.0);
+                        let vib = 1.0 + (t * 5.2 * TAU).sin() * 0.004 * (t / 0.3).min(1.0);
+                        ph += f * vib / RATE;
+                        let x = ph.fract();
+                        let tone = if instrument == 1 {
+                            (x * TAU).sin() + (2.0 * x * TAU).sin() * 0.15 + rng.noise() * 0.04
+                        } else {
+                            // A band-limited-ish saw for the bow, darkened by the filter.
+                            (x * 2.0 - 1.0) * 0.6 + (x * TAU).sin() * 0.5 + rng.noise() * 0.02
+                        };
+                        if let Some(o) = out.get_mut(start + k) {
+                            *o += lp.run(tone) * env * 0.35;
+                        }
+                    }
+                }
+            }
+        }
+        t0 += dur;
+    }
+    out
+}
+
+fn portal(rng: &mut Rng) -> Vec<f32> {
+    let dur = 2.6;
+    let n = (dur * RATE) as usize;
+    let mut breath = LowPass::new(260.0);
+    let mut floor = LowPass::new(60.0);
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            let wob = 1.0 + 0.04 * (t * 3.1 * TAU).sin();
+            let hum = (t * 55.0 * wob * TAU).sin() * 0.5 + (t * 58.3 * wob * TAU).sin() * 0.4 + (t * 110.0 * TAU).sin() * 0.12;
+            let x = rng.noise();
+            let b = breath.run(x);
+            let air = (b - floor.run(b)) * 1.6;
+            let env = (t / 0.6).min(1.0) * (1.0 - t / dur).powf(1.3);
+            (hum + air) * env * 0.55
+        })
+        .collect()
+}
+
+/// Half a second of an engine: low pulses (cylinders firing, or rotor blades beating the air)
+/// over a dark rumble, quicker and a little louder with more throttle. Played back to back.
+fn engine(rng: &mut Rng, kind: u8, throttle: u8) -> Vec<f32> {
+    let dur = 0.5;
+    let n = (dur * RATE) as usize;
+    let th = throttle.min(4) as f32 / 4.0;
+    let (base, rate, cut) = match kind {
+        0 => (38.0 + 22.0 * th, 14.0 + 22.0 * th, 320.0),
+        1 => (30.0 + 10.0 * th, 6.0 + 8.0 * th, 220.0),
+        _ => (32.0 + 8.0 * th, 5.0 + 6.0 * th, 200.0),
+    };
+    let mut lp = LowPass::new(cut);
+    let mut rumble = LowPass::new(90.0);
+    let mut phase = 0.0f32;
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            phase += rate / RATE;
+            let pulse = (1.0 - phase.fract()).powf(6.0);
+            let tone = (t * base * TAU).sin() * 0.5 + (t * base * 1.5 * TAU).sin() * 0.15;
+            let x = rng.noise();
+            let body = lp.run(x * pulse * 2.5) + rumble.run(x) * 0.8;
+            let fade = (t / 0.03).min(1.0) * ((dur - t) / 0.03).min(1.0);
+            (tone * (0.4 + 0.6 * pulse) + body) * fade * (0.25 + 0.2 * th)
+        })
+        .collect()
+}
+
+/// A spell: a low breathy whoosh over a soft hum whose note depends on the school; the hit is
+/// a shorter thump. Kept deep like the rest of the game's sounds.
+fn cast(rng: &mut Rng, school: u8, hit: bool) -> Vec<f32> {
+    let dur = if hit { 0.35 } else { 0.5 };
+    let n = (dur * RATE) as usize;
+    let note = [98.0, 130.8, 110.0, 146.8, 123.5, 82.4][school as usize % 6];
+    let mut lp = LowPass::new(if hit { 380.0 } else { 650.0 });
+    let mut low = LowPass::new(120.0);
+    let mut phase = 0.0f32;
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            let x = rng.noise();
+            let air = lp.run(x) - low.run(x);
+            // The hum bends down a little as the spell flies off.
+            let f = note * (1.0 + 0.25 * (1.0 - t / dur));
+            phase += f / RATE;
+            let hum = (phase * std::f32::consts::TAU).sin() + 0.3 * (phase * 2.0 * std::f32::consts::TAU).sin();
+            let env = (t * if hit { 200.0 } else { 25.0 }).min(1.0) * (1.0 - t / dur).powf(if hit { 2.5 } else { 1.6 });
+            (air * 1.4 + hum * 0.35) * env
+        })
+        .collect()
+}
+
+/// A spell's own voice, made like the thing it is rather than a tone: fire roars and crackles,
+/// ice crunches, lightning snaps, water sloshes, a scythe whooms as it spins, bees buzz, the void
+/// rumbles. `hit`: the impact instead of the throw. Kinds: 0 fire, 1 ice, 2 lightning,
+/// 3 arcane, 4 leaves and spores, 5 water, 6 scythe, 7 bees, 8 void, 9 stars, 10 rock.
+fn spell(rng: &mut Rng, kind: u8, hit: bool) -> Vec<f32> {
+    let dur = match (kind, hit) {
+        (8, _) => 0.9,
+        (6, false) => 0.7,
+        (10, true) => 0.8,
+        (_, true) => 0.4,
+        _ => 0.5,
+    };
+    let n = (dur * RATE) as usize;
+    let mut a = LowPass::new(600.0);
+    let mut b = LowPass::new(150.0);
+    let mut c = LowPass::new(900.0);
+    let mut d = LowPass::new(250.0);
+    // Random crackle: sparse clicks with their own low-passed ring.
+    let mut click = 0.0f32;
+    let mut phase = 0.0f32;
+    let mut bubble = (0.0f32, 0.0f32, 0.0f32); // (phase, freq, left)
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            let u = t / dur;
+            let x = rng.noise();
+            match kind {
+                0 => {
+                    // A roar of flame (low band of noise swelling and falling) with crackles.
+                    a.set(if hit { 500.0 } else { 300.0 + 500.0 * (u * 3.0).min(1.0) * (1.0 - u) });
+                    let roar = a.run(x) - b.run(x) * 0.7;
+                    if rng.next() < if hit { 0.004 } else { 0.0015 } {
+                        click = rng.range(0.5, 1.0);
+                    }
+                    click *= 0.993;
+                    let crack = c.run(click * rng.noise());
+                    let env = (t * if hit { 80.0 } else { 12.0 }).min(1.0) * (1.0 - u).powf(1.4);
+                    (roar * 2.2 + crack * 1.4) * env
+                }
+                1 => {
+                    // Ice: a swish when thrown; a crunch of breaking grains when it hits.
+                    if hit {
+                        if rng.next() < 0.01 * (1.0 - u) {
+                            click = rng.range(0.4, 1.0);
+                        }
+                        click *= 0.985;
+                        let grains = c.run(click * x) - d.run(click * x) * 0.5;
+                        let thunk = (t * 180.0 * TAU).sin() * (-t * 30.0).exp() * 0.4;
+                        grains * 2.5 + thunk
+                    } else {
+                        a.set(400.0 + 600.0 * (1.0 - u));
+                        let air = a.run(x) - b.run(x);
+                        air * 1.8 * (t * 30.0).min(1.0) * (1.0 - u).powf(1.8)
+                    }
+                }
+                2 => {
+                    // Lightning: dense snapping sparks over a low buzz.
+                    if rng.next() < if hit { 0.02 } else { 0.012 } {
+                        click = rng.range(0.6, 1.0) * if rng.next() < 0.5 { 1.0 } else { -1.0 };
+                    }
+                    click *= 0.97;
+                    let snap = c.run(click) - d.run(click) * 0.6;
+                    phase += 55.0 / RATE;
+                    let buzz = b.run(((phase * TAU).sin() + x * 0.3).signum()) * 0.25;
+                    let env = (t * 60.0).min(1.0) * (1.0 - u).powf(if hit { 2.0 } else { 1.5 });
+                    (snap * 1.2 + buzz * 0.7) * env
+                }
+                3 => {
+                    // Arcane: a soft breath with a hollow low ring under it, like air over a jar.
+                    let air = a.run(x) - b.run(x);
+                    phase += (if hit { 150.0 } else { 196.0 } * (1.0 - 0.2 * u)) / RATE;
+                    let hollow = d.run((phase * TAU).sin() * (1.0 + x * 0.6));
+                    let env = (t * if hit { 60.0 } else { 15.0 }).min(1.0) * (1.0 - u).powf(1.6);
+                    (air * 1.2 + hollow * 0.9) * env
+                }
+                4 => {
+                    // Leaves and spores: a rustle, bursts of noise coming and going.
+                    let gust = (b.run(rng.noise()) * 40.0).abs().min(1.0);
+                    let rustle = a.run(x) - d.run(x);
+                    let thud = if hit { (t * 90.0 * TAU).sin() * (-t * 25.0).exp() * 0.6 } else { 0.0 };
+                    let env = (t * 25.0).min(1.0) * (1.0 - u).powf(1.3);
+                    (rustle * gust * 2.4 + thud) * env
+                }
+                5 => {
+                    // Water: a slosh (noise through a wobbling filter) with bubbles popping in it.
+                    a.set(300.0 + 250.0 * (t * 9.0).sin().abs());
+                    let slosh = a.run(x) - b.run(x) * 0.5;
+                    if bubble.2 <= 0.0 && rng.next() < 0.0012 {
+                        bubble = (0.0, rng.range(180.0, 420.0), rng.range(0.03, 0.07));
+                    }
+                    let mut pop = 0.0;
+                    if bubble.2 > 0.0 {
+                        bubble.1 *= 1.0 + 3.0 / RATE;
+                        bubble.0 += bubble.1 / RATE;
+                        pop = (bubble.0 * TAU).sin() * (bubble.2 * 20.0).min(1.0) * 0.35;
+                        bubble.2 -= 1.0 / RATE;
+                    }
+                    let env = (t * if hit { 90.0 } else { 20.0 }).min(1.0) * (1.0 - u).powf(1.5);
+                    (slosh * 2.2 + pop) * env
+                }
+                6 => {
+                    if hit {
+                        // A slice: a short hiss and a low knock.
+                        let hiss = c.run(x) - b.run(x);
+                        let knock = (t * 120.0 * TAU).sin() * (-t * 35.0).exp();
+                        (hiss * 1.6 * (-t * 18.0).exp() + knock * 0.5) * (1.0 - u)
+                    } else {
+                        // Whoom, whoom: the blade cutting the air as it turns, speeding up.
+                        phase += (5.0 + 9.0 * u) / RATE;
+                        let pass = ((phase * TAU).sin() * 0.5 + 0.5).powf(3.0);
+                        a.set(250.0 + 500.0 * pass);
+                        let air = a.run(x) - b.run(x) * 0.6;
+                        air * (0.3 + pass * 2.2) * (t * 20.0).min(1.0) * (1.0 - u).powf(1.2)
+                    }
+                }
+                7 => {
+                    // Bees: noise beaten by the wings (about 130 times a second), wavering.
+                    phase += (125.0 + 15.0 * (t * 7.0).sin()) / RATE;
+                    let wing = ((phase * TAU).sin() * 0.5 + 0.5).powf(2.0);
+                    let buzz = c.run(x * wing) - d.run(x * wing) * 0.4;
+                    let env = (t * 30.0).min(1.0) * (1.0 - u).powf(if hit { 3.0 } else { 1.0 });
+                    buzz * 3.0 * env
+                }
+                8 => {
+                    // The void: a deep rumble that swells and drifts.
+                    b.set(70.0 + 40.0 * (t * 2.0).sin());
+                    let rumble = b.run(x) * 8.0;
+                    let swirl = (a.run(x) - d.run(x)) * (t * 5.0).sin().abs() * 0.6;
+                    let env = (t * if hit { 30.0 } else { 3.0 }).min(1.0) * (1.0 - u).powf(1.3);
+                    (rumble + swirl) * env
+                }
+                9 => {
+                    // Stars: a light rush of air with a few soft, low glassy taps.
+                    let air = a.run(x) - b.run(x);
+                    if rng.next() < 0.0008 {
+                        bubble = (0.0, rng.range(330.0, 560.0), 0.25);
+                    }
+                    let mut tap = 0.0;
+                    if bubble.2 > 0.0 {
+                        bubble.0 += bubble.1 / RATE;
+                        tap = ((bubble.0 * TAU).sin() + 0.4 * (bubble.0 * 1.5 * TAU).sin()) * bubble.2 * 0.6;
+                        bubble.2 *= 0.9997;
+                    }
+                    let env = (t * 25.0).min(1.0) * (1.0 - u).powf(1.4);
+                    (air * 1.3 + tap) * env
+                }
+                _ => {
+                    // Rock: a heavy rush of air when thrown, a deep crunching thud when it lands.
+                    if hit {
+                        let thud = b.run(x) * 7.0 * (-t * 6.0).exp();
+                        let crunch = (c.run(x) - d.run(x)) * (-t * 14.0).exp() * 1.5;
+                        thud + crunch
+                    } else {
+                        a.set(200.0 + 400.0 * u);
+                        (a.run(x) - b.run(x) * 0.4) * 2.0 * (t * 8.0).min(1.0) * (1.0 - u).powf(1.2)
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
+/// Rolling thunder: a crack when close, then a long low rumble that swells and fades.
+fn thunder(rng: &mut Rng, close: f32) -> Vec<f32> {
+    let dur = 4.0;
+    let n = (dur * RATE) as usize;
+    let mut low = LowPass::new(90.0);
+    let mut mid = LowPass::new(500.0);
+    let mut swell = LowPass::new(3.0);
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            let x = rng.noise();
+            // Slow random loudness so it rolls instead of hissing.
+            let roll = (swell.run(rng.noise()) * 30.0).abs().min(1.0) * 0.6 + 0.4;
+            let crack = if t < 0.25 { mid.run(x) * close * (1.0 - t / 0.25) * 1.5 } else { 0.0 };
+            let env = (t * 3.0).min(1.0) * (1.0 - t / dur).powf(1.6);
+            (low.run(x) * 9.0 * roll * (0.5 + close * 0.5) + crack) * env
+        })
+        .collect()
+}
+
+/// Rain: a steady low wash with soft drops landing in it. Starts and ends quiet so the
+/// pieces join without a click.
+fn rain(rng: &mut Rng) -> Vec<f32> {
+    let dur = 2.0;
+    let n = (dur * RATE) as usize;
+    let mut wash = LowPass::new(700.0);
+    let mut floor = LowPass::new(120.0);
+    let mut out: Vec<f32> = (0..n).map(|_| {
+        let x = rng.noise();
+        let w = wash.run(x);
+        (w - floor.run(w) * 0.5) * 0.35
+    }).collect();
+    for _ in 0..120 {
+        let at = (rng.range(0.0, 1.0) * (n as f32 - 2000.0)) as usize;
+        let f0 = rng.range(140.0, 380.0);
+        let amp = rng.range(0.02, 0.07);
+        for k in 0..900 {
+            let t = k as f32 / RATE;
+            out[at + k] += (t * f0 * TAU).sin() * amp * (-t * 90.0).exp();
+        }
+    }
+    let fade = (0.03 * RATE) as usize;
+    for k in 0..fade {
+        let g = k as f32 / fade as f32;
+        out[k] *= g;
+        out[n - 1 - k] *= g;
+    }
+    out
+}
+
+/// One bubble: a damped tone whose pitch rises as it closes.
+fn bubble(out: &mut [f32], start: usize, f0: f32, amp: f32, len: f32) {
+    let n = (len * RATE) as usize;
+    let mut phase = 0.0f32;
+    for k in 0..n {
+        let i = start + k;
+        if i >= out.len() {
+            break;
+        }
+        let t = k as f32 / RATE;
+        phase += f0 * (1.0 + 2.5 * t / len) / RATE;
+        out[i] += (phase * TAU).sin() * amp * (-t / (len * 0.35)).exp() * (t * 2000.0).min(1.0);
+    }
+}
+
+/// Falling into water: a body of low noise, then bubbles.
+fn splash(rng: &mut Rng, strength: f32) -> Vec<f32> {
+    let dur = 0.5 + strength * 0.5;
+    let n = (dur * RATE) as usize;
+    let mut lp = LowPass::new(1400.0);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = i as f32 / RATE;
+        // The splash darkens as the water closes over.
+        lp.set(1100.0 - 650.0 * (t / dur));
+        let e = (t * 300.0).min(1.0) * (-t / (0.08 + 0.12 * strength)).exp() + 0.15 * (-t / 0.35).exp();
+        out.push(lp.run(rng.noise()) * e * 2.6 * strength.sqrt());
+    }
+    let count = (6.0 + strength * 10.0) as usize;
+    for _ in 0..count {
+        let start = (rng.range(0.03, dur * 0.8) * RATE) as usize;
+        bubble(&mut out, start, rng.range(260.0, 620.0), rng.range(0.05, 0.14), rng.range(0.03, 0.07));
+    }
+    out
+}
+
+/// A swimming stroke: a soft slosh with a couple of bubbles.
+fn swim(rng: &mut Rng) -> Vec<f32> {
+    let dur = 0.4;
+    let n = (dur * RATE) as usize;
+    let mut lp = LowPass::new(800.0);
+    let mut out: Vec<f32> = (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE;
+            let e = (t / dur * std::f32::consts::PI).sin().powi(2);
+            lp.run(rng.noise()) * e * 0.9
+        })
+        .collect();
+    for _ in 0..3 {
+        let start = (rng.range(0.05, 0.3) * RATE) as usize;
+        bubble(&mut out, start, rng.range(300.0, 520.0), 0.06, 0.05);
+    }
+    out
+}
+
+/// Drips or rising bubbles.
+fn drips(rng: &mut Rng, dur: f32, count: usize) -> Vec<f32> {
+    let n = (dur * RATE) as usize;
+    let mut out = vec![0.0; n];
+    let mut lp = LowPass::new(500.0);
+    for (i, s) in out.iter_mut().enumerate() {
+        let t = i as f32 / RATE;
+        *s = lp.run(rng.noise()) * 0.25 * (-t / 0.2).exp();
+    }
+    for _ in 0..count {
+        let start = (rng.range(0.0, dur * 0.75) * RATE) as usize;
+        bubble(&mut out, start, rng.range(280.0, 560.0), rng.range(0.08, 0.15), rng.range(0.035, 0.06));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Zero crossings per second / 2 is a rough pitch estimate: block and water sounds must stay low.
+    fn brightness(v: &[f32]) -> f32 {
+        let zc = v.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count();
+        zc as f32 / (v.len() as f32 / RATE) / 2.0
+    }
+
+    #[test]
+    fn effects_are_low_and_clean() {
+        // Blocks, footsteps, the player's hurt and death and mob hits are real recordings now;
+        // block_sounds.rs and hit_sounds.rs test those (natural crunches cross zero far more
+        // often than a synthesized thump, so they get their own measure there). Their
+        // synthesized stand-ins must still be low.
+        let mut all = Vec::new();
+        for m in Material::ALL {
+            let b = m.base();
+            for v in [block(b, &mut Rng(7), 0.38, 1.0, 0.22, 0.95), block(b, &mut Rng(9), 0.11, 0.6, 0.04, 0.45)] {
+                assert!(brightness(&v) < 1300.0, "{m:?} stand-in too bright");
+            }
+            let rec = synth(Sfx::Step(m), 7);
+            assert!(rec.iter().any(|x| x.abs() > 0.02), "{m:?} step is silent");
+        }
+        all.extend([Sfx::Click, Sfx::Respawn, Sfx::Explode, Sfx::Splash(1.0), Sfx::Swim, Sfx::WaterExit, Sfx::Bubbles, Sfx::Pickup, Sfx::Xp, Sfx::Eat, Sfx::Gulp, Sfx::Uncork, Sfx::PotionBreak, Sfx::Fizz, Sfx::Thunder(1.0), Sfx::Thunder(0.2), Sfx::Rain, Sfx::Piston(true), Sfx::Piston(false), Sfx::Portal]);
+        all.extend((0..3).flat_map(|i| (0..4).map(move |t| Sfx::Melody(i, t))));
+        all.extend((0..14).flat_map(|i| (0..4).map(move |k| Sfx::Riff(i, k))));
+        all.extend((0..6).flat_map(|k| [Sfx::Cast(k), Sfx::SpellHit(k)]));
+        all.extend((0..11).flat_map(|k| [Sfx::Spell(k, false), Sfx::Spell(k, true)]));
+        all.extend((0..3).flat_map(|k| [Sfx::Engine(k, 0), Sfx::Engine(k, 4)]));
+        all.extend((0..4).flat_map(|i| [Sfx::Note(0, i), Sfx::Note(12, i), Sfx::Note(24, i)]));
+        for sfx in all {
+            let v = synth(sfx, 7);
+            assert!(!v.is_empty() && v.iter().all(|x| x.is_finite()), "{sfx:?}");
+            let peak = v.iter().fold(0.0f32, |a, x| a.max(x.abs()));
+            assert!(peak > 0.02, "{sfx:?} is silent");
+            let b = brightness(&v);
+            assert!(b < 1300.0, "{sfx:?} too bright: {b} Hz");
+            println!("{sfx:?}: peak {peak:.2}, ~{b:.0} Hz");
+        }
+    }
+}

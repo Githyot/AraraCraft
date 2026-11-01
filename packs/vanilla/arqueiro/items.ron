@@ -1,0 +1,22 @@
+// The archer class's own items (plan/arcos-analise.md). Made by tools/gen_archery.py:
+// edit it and run it again.
+(items: [
+    (name: "hive_bow", display_name: Some("Arco da Colmeia"), max_stack: Some(1), tool: Some((kind: Sword, tier: 1, speed: 1.0, damage: 1.0, durability: 700))),
+    (name: "batwing_bow", display_name: Some("Arco Asa-de-Morcego"), max_stack: Some(1), tool: Some((kind: Sword, tier: 1, speed: 1.0, damage: 1.0, durability: 1000))),
+    (name: "marrow_bow", display_name: Some("Arco de Tutano"), max_stack: Some(1), tool: Some((kind: Sword, tier: 1, speed: 1.0, damage: 1.0, durability: 1200))),
+    (name: "frost_bow", display_name: Some("Arco Gélido"), max_stack: Some(1), tool: Some((kind: Sword, tier: 1, speed: 1.0, damage: 1.0, durability: 1200))),
+    (name: "storm_bow", display_name: Some("Arco da Tempestade"), max_stack: Some(1), tool: Some((kind: Sword, tier: 1, speed: 1.0, damage: 1.0, durability: 1300))),
+    (name: "pulse_bow", display_name: Some("Arco Pulsante"), max_stack: Some(1), tool: Some((kind: Sword, tier: 1, speed: 1.0, damage: 1.0, durability: 1800))),
+    (name: "tide_bow", display_name: Some("Arco da Maré"), max_stack: Some(1), tool: Some((kind: Sword, tier: 1, speed: 1.0, damage: 1.0, durability: 1800))),
+    (name: "phoenix_bow", display_name: Some("Arco Fênix"), max_stack: Some(1), tool: Some((kind: Sword, tier: 1, speed: 1.0, damage: 1.0, durability: 2400))),
+    (name: "skysplit_bow", display_name: Some("Arco Celeste Partido"), max_stack: Some(1), tool: Some((kind: Sword, tier: 1, speed: 1.0, damage: 1.0, durability: 2400))),
+    (name: "molten_quiver", display_name: Some("Aljava Derretida"), max_stack: Some(1)),
+    (name: "magic_quiver", display_name: Some("Aljava Mágica"), max_stack: Some(1)),
+    (name: "ranger_scope", display_name: Some("Mira do Patrulheiro"), max_stack: Some(1)),
+    (name: "bone_arrow", display_name: Some("Flecha de Osso")),
+    (name: "venom_arrow", display_name: Some("Flecha Venenosa")),
+    (name: "cursed_arrow", display_name: Some("Flecha Amaldiçoada")),
+    (name: "ichor_arrow", display_name: Some("Flecha de Icor")),
+    (name: "verdite_arrow", display_name: Some("Flecha de Verdita")),
+    (name: "lumite_arrow", display_name: Some("Flecha de Lumita")),
+])

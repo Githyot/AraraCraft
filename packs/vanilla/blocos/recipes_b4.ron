@@ -1,0 +1,35 @@
+// Lote B4 of the block review (plan/blocos-analise.md). Made by tools/gen_blocos_b4.py:
+// edit it and run it again.
+(
+    shaped: [
+        (pattern: ["###", "###", "###"], key: {'#': "bamboo"}, result: "bamboo_block", count: 1),
+        (pattern: ["#", "#"], key: {'#': "bamboo_slab"}, result: "bamboo_mosaic", count: 1),
+        (pattern: ["###"], key: {'#': "bamboo_planks"}, result: "bamboo_slab", count: 6),
+        (pattern: ["#  ", "## ", "###"], key: {'#': "bamboo_planks"}, result: "bamboo_stairs", count: 4),
+        (pattern: ["###"], key: {'#': "bamboo_mosaic"}, result: "bamboo_mosaic_slab", count: 6),
+        (pattern: ["#  ", "## ", "###"], key: {'#': "bamboo_mosaic"}, result: "bamboo_mosaic_stairs", count: 4),
+        (pattern: ["#|#", "#|#"], key: {'#': "bamboo_planks", '|': "stick"}, result: "bamboo_fence", count: 3),
+        (pattern: ["|#|", "|#|"], key: {'#': "bamboo_planks", '|': "stick"}, result: "bamboo_fence_gate", count: 1),
+        (pattern: ["##", "##", "##"], key: {'#': "bamboo_planks"}, result: "bamboo_door", count: 3),
+        (pattern: ["###", "###"], key: {'#': "bamboo_planks"}, result: "bamboo_trapdoor", count: 2),
+        (pattern: ["##"], key: {'#': "bamboo_planks"}, result: "bamboo_pressure_plate", count: 1),
+        (pattern: ["###", "###", " | "], key: {'#': "bamboo_planks", '|': "stick"}, result: "bamboo_sign", count: 3),
+        (pattern: ["| |", "###", "###"], key: {'#': "stripped_oak_log", '|': "chain"}, result: "oak_hanging_sign", count: 6),
+        (pattern: ["| |", "###", "###"], key: {'#': "stripped_spruce_log", '|': "chain"}, result: "spruce_hanging_sign", count: 6),
+        (pattern: ["| |", "###", "###"], key: {'#': "stripped_birch_log", '|': "chain"}, result: "birch_hanging_sign", count: 6),
+        (pattern: ["| |", "###", "###"], key: {'#': "stripped_jungle_log", '|': "chain"}, result: "jungle_hanging_sign", count: 6),
+        (pattern: ["| |", "###", "###"], key: {'#': "stripped_acacia_log", '|': "chain"}, result: "acacia_hanging_sign", count: 6),
+        (pattern: ["| |", "###", "###"], key: {'#': "stripped_dark_oak_log", '|': "chain"}, result: "dark_oak_hanging_sign", count: 6),
+        (pattern: ["| |", "###", "###"], key: {'#': "stripped_mangrove_log", '|': "chain"}, result: "mangrove_hanging_sign", count: 6),
+        (pattern: ["| |", "###", "###"], key: {'#': "stripped_cherry_log", '|': "chain"}, result: "cherry_hanging_sign", count: 6),
+        (pattern: ["| |", "###", "###"], key: {'#': "stripped_pale_oak_log", '|': "chain"}, result: "pale_oak_hanging_sign", count: 6),
+        (pattern: ["| |", "###", "###"], key: {'#': "stripped_crimson_stem", '|': "chain"}, result: "crimson_hanging_sign", count: 6),
+        (pattern: ["| |", "###", "###"], key: {'#': "stripped_warped_stem", '|': "chain"}, result: "warped_hanging_sign", count: 6),
+        (pattern: ["| |", "###", "###"], key: {'#': "stripped_bamboo_block", '|': "chain"}, result: "bamboo_hanging_sign", count: 6),
+    ],
+    shapeless: [
+        (ingredients: ["bamboo_block"], result: "bamboo_planks", count: 2),
+        (ingredients: ["stripped_bamboo_block"], result: "bamboo_planks", count: 2),
+        (ingredients: ["bamboo_planks"], result: "bamboo_button", count: 1),
+    ],
+)

@@ -1,0 +1,16 @@
+// Recipes of the swords added in the sword review (packs/vanilla/espadas/items.ron).
+(
+    shaped: [
+        (pattern: ["C", "C", "S"], key: {'C': "cactus", 'S': "stick"}, result: "cactus_sword"),
+        (pattern: ["B", "B", "S"], key: {'B': "bone", 'S': "stick"}, result: "bone_sword"),
+        (pattern: [" P ", "PSP", " P "], key: {'P': "packed_ice", 'S': "iron_sword"}, result: "ice_blade"),
+        (pattern: ["M", "M", "D"], key: {'M': "meteorite_ingot", 'D': "diamond"}, result: "light_blade"),
+    ],
+    shapeless: [
+        (ingredients: ["string", "string", "string", "string", "slime_ball"], result: "yoyo_string"),
+        (ingredients: ["golden_sword", "feather", "feather", "feather"], result: "falcon_blade"),
+        (ingredients: ["ice_blade", "frost_core", "cobalt_ingot", "cobalt_ingot", "cobalt_ingot"], result: "frost_brand"),
+        (ingredients: ["giant_gauntlet", "magma_heart"], result: "fire_gauntlet"),
+        (ingredients: ["giant_gauntlet", "iron_block", "iron_block", "leather", "leather"], result: "berserker_glove"),
+    ],
+)

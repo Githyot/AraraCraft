@@ -1,0 +1,33 @@
+/target
+/target-*
+/saves
+/settings.ron
+/resourcepacks/*
+!/resourcepacks/README.md
+/music/*
+!/music/README.md
+*.png.tmp
+/screenshots
+/crash.txt
+__pycache__/
+/paintings/*
+/shaderpacks
+/.claude/
+/plugins
+/bench
+/melodies/
+/dist
+
+# Local runtime files the game writes next to itself (never commit them)
+/multiplayer.ron
+/.multijogador/
+*.pyc
+
+# Third-party packs and archives: Mojang/Terraria art must never enter the repository
+/assets/resourcepacks/
+*.zip
+*.rar
+*.7z
+*.jar
+*.mcpack
+*.mcworld

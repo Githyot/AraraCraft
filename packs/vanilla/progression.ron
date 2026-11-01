@@ -1,0 +1,420 @@
+#![enable(implicit_some)]
+// The game's progression (Terraria's idea of a long road with a goal at the end): chapters in
+// order, each with goals, a few words the Guide says when it opens and closes, and a reward the
+// Guide hands over. Design notes: /mnt/project-files/plan/progressao.md and
+// /mnt/project-files/plan/progressao-intuitiva.md.
+//
+// Chapter fields:
+//   era        which of the six stages of balance.rs it belongs to (0 Pré-chefe .. 5 Fim de jogo)
+//   side       a side path: shown in the journal and claimable, but never the "current" chapter
+//   ready      (health, defense) the Guide recommends before the chapter's boss
+//   money      coins the Guide hands over with the reward, in copper (100 = 1 silver)
+//
+// `need` kinds:
+//   Item([names])     carry any of these (a * at the start or end matches many: "*_log", "cooked_*")
+//   Boss(name)        that boss was defeated in this world (a * works: "pillar_*")
+//   Bosses([names], n)  n of those bosses were defeated
+//   Npc(name)         that town NPC lives here
+//   Town(n)           n people live in your town
+//   Dim(name)         set foot in that dimension: "nether", "end", "aether", "otherside"
+//   Health(n) / Mana(n)   most health / mana reached n (20 at the start)
+//   Defense(n)        your defense reached n
+//   Depth(y)          stood at height y or below
+//   Biome([names])    stood in one of these surface biomes ("*Jungle*" works)
+//   Structure([names])  stood inside one of these buildings
+//   Land(name)        stood in an evil land: "ruin", "blight", "evil" (either) or "prism"
+//   Kill(name, n)     defeated n of that creature (a * works here too)
+//   Skill(n)          one of your ofícios reached level n
+//   Money(copper)     carry this much money
+//   Hard              the World Breaker fell (hard mode)
+//   Night             lived through a whole night in survival
+//   House             built a valid house (door, light, table, closed room)
+//
+// Goal fields: `optional: true` goals are extra (they don't hold the chapter); `summon` names the
+// item that wakes a boss, so the journal can show its recipe and where it works; `find` tells
+// the Guide's compass where to point (Structure([...]), Biome([...]), Land(name) or Down(y));
+// Depth, Biome, Structure and Land goals point by themselves. `said` is what the Guide says when
+// the goal is done (what it opened up).
+//
+// A goal that names an item or creature the game doesn't have yet is shown as "em breve" and does
+// not block its chapter, so other parts of the game can land later and the road fills in by itself.
+(
+    chapters: [
+        // ---------------------------------------------------------------- Era 0: Pré-chefe
+        (
+            id: "primeiro_dia",
+            era: 0,
+            title: "Primeiro dia",
+            intro: "Olá! Eu sou o Guia. Vou te ajudar a sobreviver aqui. Primeiro, madeira: segure o botão esquerdo numa árvore.",
+            outro: "Você sobreviveu à primeira noite! Agora vamos fazer deste lugar um lar.",
+            reward: [("bread", 4), ("torch", 8)],
+            goals: [
+                (id: "madeira", text: "Corte madeira", hint: "Segure o botão esquerdo num tronco de árvore até ele soltar. Qualquer árvore serve.", need: Item(["*_log"])),
+                (id: "bancada", text: "Faça uma bancada", hint: "Abra o inventário (E), transforme troncos em tábuas e junte 4 tábuas num quadrado 2x2.", need: Item(["crafting_table"])),
+                (id: "picareta", text: "Faça uma picareta de madeira", hint: "Coloque a bancada no chão e clique nela com o botão direito. Três tábuas em cima e dois gravetos no meio.", need: Item(["wooden_pickaxe"])),
+                (id: "pedra", text: "Minere pedra", hint: "Com a picareta, cave a pedra cinza das encostas ou de um buraco. Ela vira pedregulho.", need: Item(["cobblestone"])),
+                (id: "tochas", text: "Faça tochas", hint: "Carvão aparece em pontos pretos na pedra. Carvão em cima de um graveto dá 4 tochas.", need: Item(["torch"])),
+                (id: "noite", text: "Sobreviva à primeira noite", hint: "Quando escurecer, monstros saem. Fique num abrigo iluminado, ou cave um buraco e tampe a entrada.", need: Night),
+            ],
+        ),
+        (
+            id: "um_lar",
+            era: 0,
+            title: "Um lar de verdade",
+            intro: "Um abrigo salva a noite; uma casa traz gente. Construa uma casa com porta, luz e uma mesa, que eu me mudo para ela.",
+            outro: "Que casa bonita! Tome estas moedas: com 50 de prata no bolso e uma casa livre, um mercador vem morar aqui.",
+            reward: [("apple", 4)],
+            money: 5000,
+            goals: [
+                (id: "casa", text: "Construa uma casa", hint: "Um cômodo fechado (paredes, chão e teto), entre 20 e 400 blocos de ar, com porta, uma tocha e uma bancada ou baú.", need: House, said: "Uma casa! Toda casa livre que você construir pode receber um morador novo."),
+                (id: "fornalha", text: "Faça uma fornalha", hint: "Oito pedregulhos em volta da bancada, deixando o meio vazio.", need: Item(["furnace"])),
+                (id: "ferramentas", text: "Faça uma picareta de pedra", hint: "Igual à de madeira, mas com pedregulho em cima. Ela minera cobre e estanho, o primeiro degrau dos metais.", need: Item(["stone_pickaxe"])),
+                (id: "carvao", text: "Junte carvão", hint: "Minere os pontos pretos na pedra, ou queime troncos na fornalha para fazer carvão vegetal.", need: Item(["coal", "charcoal"])),
+                (id: "cama", text: "Faça uma cama", hint: "Três lãs em cima e três tábuas embaixo. Tosquie ou derrote ovelhas para conseguir lã. Dormir pula a noite.", need: Item(["*_bed"])),
+                (id: "bau", text: "Faça um baú", hint: "Oito tábuas em volta da bancada. Guarde o que não cabe no inventário.", need: Item(["chest"])),
+                (id: "comida", text: "Cozinhe alguma comida", hint: "Carne crua na fornalha, com carvão embaixo. Comida cozida enche muito mais a fome.", need: Item(["cooked_*", "bread", "baked_potato"]), optional: true),
+            ],
+        ),
+        (
+            id: "metais",
+            era: 0,
+            title: "Metal e comércio",
+            intro: "Pedra quebra fácil. Desça nas cavernas atrás de metal: cobre ou estanho primeiro, depois ferro ou chumbo. Cada mundo tem o seu par.",
+            outro: "Agora sim, você parece um aventureiro. Lá embaixo, nas profundezas, tem coisa ainda melhor.",
+            reward: [("iron_ingot", 4), ("bucket", 1)],
+            goals: [
+                (id: "cobre", text: "Funda cobre ou estanho", hint: "Minério alaranjado (cobre) ou cinza-claro (estanho), logo abaixo da altura 0. Derreta na fornalha.", need: Item(["copper_ingot", "tin_ingot"]), find: Down(-10)),
+                (id: "picareta_cobre", text: "Faça uma picareta de cobre ou bronze", hint: "Três barras e dois gravetos na bancada. Cada metal novo pede a picareta do metal anterior: cobre abre o ferro.", need: Item(["copper_pickaxe", "bronze_pickaxe"])),
+                (id: "ferro", text: "Funda ferro ou chumbo", hint: "Minério com pontos bege (ferro) ou azulados (chumbo), mais fundo. Só sai com picareta de cobre ou de bronze.", need: Item(["iron_ingot", "lead_ingot"]), find: Down(-40)),
+                (id: "picareta_ferro", text: "Faça uma picareta de ferro ou chumbo", hint: "Ela abre o próximo degrau: prata e tungstênio, redstone e as primeiras gemas.", need: Item(["iron_pickaxe", "lead_pickaxe"])),
+                (id: "armadura", text: "Vista uma peça de armadura", hint: "Na bancada, lingotes no formato do capacete, peitoral, calça ou botas. Cada ponto de defesa tira dano dos golpes.", need: Item(["*_helmet", "*_chestplate", "*_leggings", "*_boots"])),
+                (id: "mercador", text: "Atraia um mercador", hint: "Ande com 50 de prata e tenha uma casa livre. Os monstros soltam moedas. Ele vende tochas, comida, baldes e poções.", need: Npc("npc_merchant"), said: "O mercador chegou! Ele vende até a Semente Ancestral, se você não achar musgo."),
+                (id: "trigo", text: "Colha trigo", hint: "Quebre grama alta para achar sementes, plante em terra arada perto da água e espere crescer.", need: Item(["wheat"])),
+                (id: "zumbis", text: "Derrote 5 zumbis", hint: "Eles aparecem à noite. Uma espada e um pouco de armadura deixam tudo mais fácil.", need: Kill("zombie", 5)),
+                (id: "bronze", text: "Faça bronze", hint: "Cobre e estanho juntos na bancada viram bronze, mais forte que os dois.", need: Item(["bronze_ingot"]), optional: true),
+                (id: "fazendeiro", text: "Atraia um fazendeiro", hint: "Ande com sementes, cenouras ou batatas e tenha uma casa livre.", need: Npc("npc_farmer"), optional: true),
+            ],
+        ),
+        (
+            id: "profundezas",
+            era: 0,
+            title: "As profundezas",
+            intro: "O mundo desce muito abaixo da altura 0. Lá embaixo crescem cristais de vida e metais preciosos. Leve muitas tochas e comida.",
+            outro: "Mais vida, mais força. Esses cristais coloridos que você achou guardam magia. Quer aprender?",
+            reward: [("torch", 16), ("cooked_beef", 6)],
+            goals: [
+                (id: "fundo", text: "Desça abaixo da altura -100", hint: "Cave em escada (nunca reto embaixo de você!) ou siga um túnel. F3 mostra a altura; um medidor de profundidade também.", need: Depth(-100), said: "Bem fundo! Daqui para baixo os túneis são longos: marque o caminho com tochas."),
+                (id: "prata", text: "Funda prata ou tungstênio", hint: "Metais das cavernas fundas, abaixo de -150. A prata é boa contra mortos-vivos.", need: Item(["silver_ingot", "tungsten_ingot"]), find: Down(-160)),
+                (id: "picareta_prata", text: "Faça uma picareta de prata ou tungstênio", hint: "Sem ela o ouro e a platina não soltam nada.", need: Item(["silver_pickaxe", "tungsten_pickaxe"])),
+                (id: "ouro", text: "Funda ouro ou platina", hint: "O metal precioso mais fundo antes do diamante, abaixo de -250.", need: Item(["gold_ingot", "platinum_ingot"]), find: Down(-260)),
+                (id: "picareta_ouro", text: "Faça uma picareta de ouro ou platina", hint: "A picareta que abre o diamante, o meteorito e o minério escuro da terra maldita.", need: Item(["golden_pickaxe", "platinum_pickaxe"])),
+                (id: "vida", text: "Use um cristal de vida", hint: "Cristais vermelhos que brilham no chão das cavernas fundas. Use um para ganhar dois corações a mais.", need: Health(22), find: Down(-120), said: "Sentiu? Mais vida. Uma enfermeira vem morar aqui se houver uma casa livre."),
+                (id: "gema", text: "Ache uma gema", hint: "Rubi, safira, topázio e ametista aparecem na pedra funda, em pontos coloridos.", need: Item(["ruby", "sapphire", "topaz", "amethyst", "emerald", "diamond"]), find: Down(-90)),
+                (id: "medidor", text: "Faça um medidor de profundidade", hint: "Cobre em volta de um pó de redstone. Mostra sempre a sua altura.", need: Item(["depth_meter"]), optional: true),
+                (id: "enfermeira", text: "Atraia uma enfermeira", hint: "Ela vem depois do primeiro cristal de vida, se houver uma casa livre. Cura você por moedas.", need: Npc("npc_nurse"), optional: true),
+                (id: "pulo_duplo", text: "Ache um pulo a mais", hint: "Garrafas de nuvem, nevasca ou areia e botas de pulo duplo aparecem nos baús das cabanas e minas das profundezas. Elas se somam!", need: Item(["cloud_bottle", "blizzard_bottle", "sandstorm_bottle", "leap_boots", "cloud_balloon"]), optional: true, find: Structure(["cabana_subterranea", "mina_abandonada", "mina_profunda"])),
+                (id: "gancho", text: "Faça um gancho", hint: "Barra de ferro e duas linhas (das aranhas). F atira o gancho e puxa você até onde ele prender.", need: Item(["*_hook"]), optional: true),
+            ],
+        ),
+        (
+            id: "magia",
+            era: 0,
+            title: "O caminho da magia",
+            intro: "Gemas viram varinhas. Uma varinha gasta mana, as estrelas azuis do canto da tela, e lança feitiços de longe.",
+            outro: "Um mago de verdade! Agora você já pode enfrentar algo grande. Vamos falar dos chefes.",
+            reward: [("mana_crystal", 1), ("lapis_lazuli", 4)],
+            goals: [
+                (id: "varinha", text: "Faça uma varinha ou cajado", hint: "Na bancada, uma gema na ponta de dois gravetos. Cada gema tem seu feitiço.", need: Item(["*_wand", "*_staff", "*_tome"])),
+                (id: "mago", text: "Atraia um mago", hint: "Ele aparece quando você carrega um item mágico e tem uma casa livre. Vende tomos e cristais de mana.", need: Npc("npc_wizard")),
+                (id: "mana", text: "Aumente sua mana", hint: "Cristais de mana dão mais uma estrela. O mago vende.", need: Mana(22)),
+                (id: "esqueletos", text: "Derrote 5 esqueletos", hint: "Treine a pontaria com magia: esqueletos atiram de longe.", need: Kill("skeleton", 5), optional: true),
+            ],
+        ),
+        // ---------------------------------------------------------------- Era 1: Início
+        (
+            id: "guardiao",
+            era: 1,
+            title: "Os primeiros chefes",
+            intro: "Chefes acordam com itens que você mesmo faz. Comece pelo Grande Olho, numa noite, e depois acorde o Guardião da Floresta. Prepare armadura, poções e uma arena aberta.",
+            outro: "Dois chefes caídos! Um ferreiro ouviu falar e quer morar aqui. E aquela estrela que caiu era um meteorito.",
+            reward: [("diamond", 2), ("life_crystal", 1)],
+            ready: (26.0, 6),
+            goals: [
+                (id: "rei_geleia", text: "Derrote o Rei Geleia", hint: "Junte gel das geleias e faça a Coroa Gelatinosa (gel em volta de uma barra de ouro). Use na superfície.", need: Boss("king_jelly"), summon: "jelly_crown", optional: true),
+                (id: "grande_olho", text: "Derrote o Grande Olho", hint: "Seis lentes e um olho de aranha fazem o Olho Suspeito; use à noite, na superfície. Ele investe: corra de lado, não para trás.", need: Boss("great_eye"), summon: "eye_lure", said: "O Olho caiu! Daqui a algumas noites, meteoros podem riscar o céu: o meteorito vira armas de fogo."),
+                (id: "musgo", text: "Junte pedregulho com musgo", hint: "Aparece em ruínas, criptas e cavernas úmidas. O mercador vende a semente pronta, se preferir.", need: Item(["mossy_cobblestone", "ancient_seed"]), find: Structure(["cripta", "ruina", "estatua_musgosa", "catacumbas"])),
+                (id: "chefe", text: "Derrote o Guardião da Floresta", hint: "Use a Semente Ancestral à noite. Na metade da vida ele fica bravo e chama mortos. Fique longe da pisada.", need: Boss("forest_guardian"), summon: "ancient_seed", said: "O Guardião caiu! O ferreiro vem morar numa casa livre e vende lingotes raros."),
+                (id: "ferreiro", text: "Atraia o ferreiro", hint: "Depois do Guardião, ele vem morar numa casa livre.", need: Npc("npc_smith")),
+                (id: "meteorito", text: "Funda meteorito", hint: "Depois de um chefe, meteoros caem em algumas noites e deixam uma cratera. Cuidado com as cabeças em chamas.", need: Item(["meteorite_ingot"]), optional: true),
+            ],
+        ),
+        (
+            id: "terra_maldita",
+            era: 1,
+            title: "A terra maldita",
+            intro: "Todo mundo tem uma terra maldita: a Ruína, roxa, ou a Chaga, vermelha. Lá dentro há minério escuro e algo que bate como um coração. E fundo na pedra, diamantes.",
+            outro: "Você enfrentou o mal deste mundo e voltou com diamantes. Agora a obsidiana não resiste mais a você.",
+            reward: [("life_crystal", 2), ("obsidian", 4)],
+            money: 3000,
+            ready: (28.0, 8),
+            goals: [
+                (id: "achar", text: "Ache a terra maldita", hint: "Manchas roxas ou vermelhas no mapa, a algumas centenas de blocos. O seu mundo tem uma delas.", need: Land("evil"), said: "Aí está ela. Quebre os orbes e corações lá embaixo: o terceiro acorda o chefe da terra."),
+                (id: "chefe_terra", text: "Derrote a Mente da Chaga ou o Verme", hint: "A Espinha da Chaga (carne podre, ossos e redstone) se usa abaixo da altura 0. A Isca de Verme (carne, terra e osso) acorda o Verme das Profundezas no subsolo.", need: Bosses(["blight_mind", "deep_worm"], 1), summon: "blight_spine", said: "Escamas sombrias! Com elas e ossos se faz o Crânio Amaldiçoado, que chama o Rei dos Ossos."),
+                (id: "barra_escura", text: "Funda sombraço ou sanguinita", hint: "O minério escuro da terra maldita. Três dão uma barra, e as ferramentas dele quebram coisas mais duras.", need: Item(["umbral_ingot", "sanguinite_ingot"]), find: Land("evil")),
+                (id: "diamante", text: "Ache um diamante", hint: "Bem fundo, abaixo da altura -300. Só sai com picareta de ouro ou de platina.", need: Item(["diamond"]), find: Down(-320)),
+                (id: "picareta_diamante", text: "Faça uma picareta de diamante", hint: "Três diamantes e dois gravetos (ou barras de sombraço ou sanguinita). Ela abre a obsidiana, a masmorra, os detritos antigos e a magmarita.", need: Item(["diamond_pickaxe", "netherite_pickaxe", "umbral_pickaxe", "sanguinite_pickaxe"])),
+            ],
+        ),
+        // ---------------------------------------------------------------- Era 2: Pré-hardmode
+        (
+            id: "masmorra",
+            era: 2,
+            title: "A masmorra e a colmeia",
+            intro: "Um velho guarda a porta de uma masmorra de tijolos. A maldição dele só acaba se o Rei dos Ossos cair. Na selva, uma colmeia gigante também espera.",
+            outro: "A masmorra está aberta! Lá dentro há chaves douradas e baús com coisas raras. Mas o frio do norte acordou também.",
+            reward: [("lesser_healing_potion", 5), ("life_crystal", 1)],
+            ready: (30.0, 10),
+            goals: [
+                (id: "achar_masmorra", text: "Ache a masmorra", hint: "Uma torre de tijolos azuis, verdes ou rosados, longe do começo do mundo.", need: Structure(["masmorra_blue", "masmorra_green", "masmorra_pink"])),
+                (id: "rei_ossos", text: "Derrote o Rei dos Ossos", hint: "Quatro ossos, uma escama sombria e lápis-lazúli fazem o Crânio Amaldiçoado. Use à noite e ataque as mãos primeiro.", need: Boss("bone_king"), summon: "cursed_skull", said: "A maldição acabou: a masmorra é sua. E os ossos espectrais dele vão servir mais tarde, para um ídolo muito perigoso."),
+                (id: "rainha_colmeia", text: "Derrote a Rainha da Colmeia", hint: "Quebre a larva no meio de uma colmeia gigante, embaixo da selva, ou use o Favo Real na selva.", need: Boss("hive_queen"), summon: "royal_comb", optional: true, find: Biome(["*Jungle*", "Mata Atlântica"])),
+                (id: "chave", text: "Ache uma chave dourada", hint: "Os monstros da masmorra às vezes deixam cair. Ela abre um baú trancado.", need: Item(["golden_key"]), optional: true),
+            ],
+        ),
+        (
+            id: "gelo",
+            era: 2,
+            title: "Os mortos do gelo",
+            intro: "Algo frio acordou no norte. Faça uma filactéria e enfrente o Lich numa noite gelada.",
+            outro: "O Lich virou pó! Com obsidiana e um isqueiro você abre a porta para baixo do mundo. Sabe o que isso quer dizer?",
+            reward: [("ender_pearl", 2), ("obsidian", 6)],
+            ready: (32.0, 12),
+            goals: [
+                (id: "colosso", text: "Derrote o Colosso do Gelo", hint: "Use o Chifre Gelado na neve. Pule as linhas de espinhos de gelo.", need: Boss("frost_colossus"), summon: "frost_horn", optional: true, find: Biome(["Snowy*", "Ice Spikes", "Grove", "Frozen*"])),
+                (id: "filacteria", text: "Faça a filactéria", hint: "Ossos nos cantos, safiras nos lados e um cristal de mana no meio.", need: Item(["lich_phylactery"])),
+                (id: "lich", text: "Derrote o Lich", hint: "Use a filactéria à noite. Ele solta anéis de gelo: pule e afaste-se.", need: Boss("lich"), summon: "lich_phylactery", find: Structure(["cripta_do_lich"])),
+                (id: "armadura_rara", text: "Vista armadura de platina, tungstênio ou diamante", hint: "O ferreiro vende os lingotes, se o seu mundo não tiver o minério.", need: Item(["platinum_chestplate", "tungsten_chestplate", "diamond_chestplate", "meteor_chestplate", "umbral_chestplate", "sanguinite_chestplate"]), optional: true),
+            ],
+        ),
+        (
+            id: "nether",
+            era: 2,
+            title: "Abaixo do mundo: o Nether",
+            intro: "Uma moldura de obsidiana de 4 por 5, acesa com isqueiro, abre um portal para o Nether. Lá é quente e hostil: leve tudo.",
+            outro: "Você voltou do Nether inteiro! Com vara de blaze dá para preparar poções, e lá no fundo do mundo arde o Submundo.",
+            reward: [("ender_pearl", 4), ("life_crystal", 1)],
+            ready: (34.0, 13),
+            goals: [
+                (id: "obsidiana", text: "Junte obsidiana", hint: "Água sobre lava parada vira obsidiana. Minere com picareta de diamante, sombraço ou sanguinita.", need: Item(["obsidian"])),
+                (id: "isqueiro", text: "Faça um isqueiro", hint: "Ferro e sílex. O sílex sai do cascalho.", need: Item(["flint_and_steel"])),
+                (id: "entrar", text: "Entre no Nether", hint: "Monte a moldura de 4x5, acenda por dentro e fique parado no portal.", need: Dim("nether")),
+                (id: "verruga", text: "Colha verruga do Nether", hint: "Cresce em areia das almas, nas fortalezas do Nether. Base de poções.", need: Item(["nether_wart"]), find: Structure(["fortaleza_do_nether"])),
+                (id: "coracao", text: "Faça o Coração de Obsidiana", hint: "Obsidiana nos cantos, ouro nos lados e um diamante no meio.", need: Item(["obsidian_heart"])),
+                (id: "obsidilito", text: "Derrote o Obsidilito", hint: "Ele levanta pilares de fogo embaixo de você: não fique parado.", need: Boss("obsidilith"), summon: "obsidian_heart", find: Structure(["anel_do_obsidilito"])),
+                (id: "blaze", text: "Pegue uma vara de blaze", hint: "Os blazes vivem nas fortalezas do Nether.", need: Item(["blaze_rod"]), optional: true, find: Structure(["fortaleza_do_nether"])),
+                (id: "quartzo", text: "Minere quartzo", hint: "Pontos brancos na pedra do Nether.", need: Item(["quartz"]), optional: true),
+                (id: "manopla", text: "Derrote a Manopla do Nether", hint: "Blocos de ouro, varas de blaze e um bloco de magma fazem o Núcleo da Manopla. Ela soca e atira um laser.", need: Boss("nether_gauntlet"), summon: "gauntlet_core", optional: true, find: Structure(["forja_da_manopla"])),
+                (id: "netherite", text: "Faça um lingote de netherite", hint: "Detritos antigos no fundo do Nether, derretidos e misturados com ouro.", need: Item(["netherite_ingot"]), optional: true),
+                (id: "wither", text: "Derrote o Wither", hint: "Três crânios sobre areia das almas em T. Lute longe de casa!", need: Boss("wither"), optional: true),
+            ],
+        ),
+        (
+            id: "encantos",
+            era: 2,
+            title: "Encantos e poções",
+            intro: "Para o que vem por aí, ferro e diamante não bastam. Encante seu equipamento e prepare poções.",
+            outro: "Com encantos e poções você está pronto para descer até o fogo.",
+            reward: [("lapis_lazuli", 8), ("experience_bottle", 8)],
+            goals: [
+                (id: "mesa", text: "Faça uma mesa de encantamento", hint: "Livro, diamantes e obsidiana. Estantes em volta deixam os encantos mais fortes.", need: Item(["enchanting_table"])),
+                (id: "bigorna", text: "Faça uma bigorna", hint: "Blocos e lingotes de ferro. Junta encantos e conserta ferramentas.", need: Item(["anvil"])),
+                (id: "alquimia", text: "Faça um suporte de poções", hint: "Vara de blaze e pedregulho.", need: Item(["brewing_stand"])),
+                (id: "pocao", text: "Prepare uma poção", hint: "Água, verruga do Nether e um ingrediente que dá o efeito.", need: Item(["potion_*", "*_potion"])),
+                (id: "farol", text: "Acenda um farol", hint: "Precisa da estrela do Wither e de uma pirâmide de metal.", need: Item(["beacon"]), optional: true),
+            ],
+        ),
+        (
+            id: "submundo",
+            era: 2,
+            title: "Fogo e cinzas",
+            intro: "No fundo do mundo, abaixo de -600, fica o Submundo: cinzas, um mar de lava e magmarita. E na superfície, os vulcões guardam um titã.",
+            outro: "Você andou sobre o fogo! Agora só falta um lugar deste mundo: o Fim.",
+            reward: [("potion_fire_resistance", 3), ("life_crystal", 1)],
+            ready: (36.0, 14),
+            goals: [
+                (id: "chegar", text: "Chegue ao Submundo", hint: "Desça além da altura -640. Leve poções de resistência ao fogo e um gancho.", need: Depth(-640)),
+                (id: "magmarita", text: "Funda magmarita", hint: "Minério alaranjado que brilha nas cinzas do Submundo. Sai com picareta de diamante, sombraço ou sanguinita.", need: Item(["magmarite_ingot"]), find: Down(-690)),
+                (id: "picareta_magma", text: "Faça uma picareta de magmarita ou netherite", hint: "A única que quebra os minérios do mundo novo depois do Quebra-Mundos (cobalto e paládio).", need: Item(["magmarite_pickaxe", "netherite_pickaxe"])),
+                (id: "vulcao", text: "Suba num vulcão", hint: "Montanhas de cinza que soltam fumaça, longe do começo. As fumarolas jogam você para cima.", need: Biome(["Volcano"]), optional: true),
+                (id: "tita", text: "Derrote o Titã de Magma", hint: "Obsidiana, enxofre e basalto fazem o Ídolo de Obsidiana. Use na cratera. Quando a lava subir, fique na borda.", need: Boss("magma_titan"), summon: "obsidian_idol", optional: true, find: Biome(["Volcano"])),
+            ],
+        ),
+        (
+            id: "fim",
+            era: 2,
+            title: "O Fim",
+            intro: "Olhos de ender, feitos de pérola, voam até a fortaleza enterrada. Lá dentro, uma moldura espera doze olhos.",
+            outro: "Você venceu o Guardião do Vazio. O mundo inteiro fala do seu nome! Mas há forças maiores dormindo sob o Nether...",
+            reward: [("diamond", 4)],
+            money: 10000,
+            ready: (38.0, 15),
+            goals: [
+                (id: "perola", text: "Junte pérolas de ender", hint: "Os andarilhos do vazio soltam. Não olhe nos olhos deles!", need: Item(["ender_pearl"])),
+                (id: "olho", text: "Faça olhos de ender", hint: "Pérola de ender com pó de blaze ou quartzo. Jogue um no ar para ver a direção.", need: Item(["ender_eye"])),
+                (id: "fortaleza", text: "Ache a fortaleza enterrada", hint: "Siga os olhos de ender. Ela fica debaixo da terra.", need: Structure(["fortaleza_subterranea", "fortaleza_enterrada"])),
+                (id: "entrar_fim", text: "Entre no Fim", hint: "Complete a moldura do portal na fortaleza enterrada e pule dentro.", need: Dim("end")),
+                (id: "guardiao_vazio", text: "Derrote o Guardião do Vazio", hint: "Quebre os cristais no alto dos pilares primeiro: eles curam o chefe.", need: Boss("void_guardian"), said: "O caminho de volta abriu. Quando estiver pronto, fale comigo sobre o Quebra-Mundos."),
+                (id: "flor", text: "Derrote a Flor do Vazio", hint: "Semente do Vazio: folhas da selva, pérolas e um cristal de vida.", need: Boss("void_blossom"), summon: "void_seed", optional: true),
+                (id: "dragao", text: "Derrote o Dragão do Fim", hint: "Ele circula os pilares. Flechas e feitiços quando ele pousar.", need: Boss("ender_dragon"), optional: true),
+                (id: "elitros", text: "Ache élitros", hint: "Nas cidades do Fim, nas ilhas de fora.", need: Item(["elytra"]), optional: true, find: Structure(["cidade_do_end"])),
+            ],
+        ),
+        // ---------------------------------------------------------------- Era 3: Hardmode
+        (
+            id: "quebra_mundo",
+            era: 3,
+            title: "O Quebra-Mundos",
+            intro: "O Quebra-Mundos dorme sob o Nether. Se cair, o mundo muda para sempre: novos minérios, a terra do Prisma e monstros mais fortes.",
+            outro: "O mundo mudou! Os seis metais novos te deixam pronto para as máquinas.",
+            reward: [("diamond", 6)],
+            money: 20000,
+            ready: (40.0, 16),
+            goals: [
+                (id: "idolo", text: "Faça o Ídolo do Quebra-Mundos", hint: "Duas obsidianas, dois ossos espectrais (do Rei dos Ossos) e uma barra de ouro.", need: Item(["breaker_idol"])),
+                (id: "chefe", text: "Derrote o Quebra-Mundos", hint: "Use o ídolo no Nether. Ele chama esqueletos de cinza e levanta fogo do chão.", need: Boss("world_breaker"), summon: "breaker_idol", said: "O mundo tremeu! Novos minérios brotaram na pedra de cada lugar que você visitar, e o Prisma apareceu. Os monstros ficaram mais fortes."),
+                (id: "cobalto", text: "Funda cobalto ou paládio", hint: "Os primeiros minérios novos, entre a superfície e -260.", need: Item(["cobalt_ingot", "palladium_ingot"]), find: Down(-40)),
+                (id: "picareta_cobalto", text: "Faça uma picareta de cobalto ou paládio", hint: "Ela abre o mitril e o oricalco. Uma broca do mesmo metal também serve.", need: Item(["cobalt_pickaxe", "palladium_pickaxe", "cobalt_drill"])),
+                (id: "mitril", text: "Funda mitril ou oricalco", hint: "Mais fundo que o cobalto, abaixo de -160. Faça uma bigorna de mitril para os itens novos.", need: Item(["mythril_ingot", "orichalcum_ingot"]), find: Down(-200)),
+                (id: "picareta_mitril", text: "Faça uma picareta de mitril ou oricalco", hint: "Ela abre a adamantita e o titânio, os mais fundos.", need: Item(["mythril_pickaxe", "orichalcum_pickaxe", "mythril_drill"])),
+                (id: "adamantita", text: "Funda adamantita ou titânio", hint: "Os minérios mais fundos do mundo novo, abaixo de -320.", need: Item(["adamantite_ingot", "titanium_ingot"]), find: Down(-360)),
+                (id: "feiticeira", text: "Atraia a feiticeira", hint: "Ela chega numa casa livre depois do Quebra-Mundos.", need: Npc("npc_sorceress"), optional: true),
+                (id: "prisma", text: "Visite o Prisma", hint: "Terras em tons pastel, com fadas e unicórnios. O pó de fada delas faz o Cristal de Gelatina.", need: Land("prism"), optional: true),
+                (id: "rainha_geleia", text: "Derrote a Rainha Geleia", hint: "Use o Cristal de Gelatina dentro do Prisma.", need: Boss("jelly_queen"), summon: "gelatin_crystal", optional: true, find: Land("prism")),
+            ],
+        ),
+        // ---------------------------------------------------------------- Era 4: Pós-mecânicos
+        (
+            id: "maquinas",
+            era: 4,
+            title: "As três máquinas",
+            intro: "Três máquinas antigas guardam o caminho para o fim de tudo. Cada uma se chama com ferro, redstone e uma isca, numa noite do mundo novo.",
+            outro: "As três máquinas caíram! Com as almas delas a selva acorda, e a verdita começa a crescer.",
+            reward: [("life_fruit", 3)],
+            money: 30000,
+            ready: (44.0, 20),
+            goals: [
+                (id: "olho_mecanico", text: "Derrote o Olho Mecânico", hint: "Olho de Engrenagem: três ferros, duas redstones e vidro. À noite, depois do Quebra-Mundos.", need: Boss("mech_eye"), summon: "gear_eye"),
+                (id: "cranio_mecanico", text: "Derrote o Crânio de Aço", hint: "Crânio de Aço: três ferros, duas redstones e um osso. Lute num lugar aberto: ele gira e investe.", need: Boss("mech_skull"), summon: "steel_skull"),
+                (id: "verme_mecanico", text: "Derrote a Serpente de Aço", hint: "Verme de Ferro: três ferros, duas redstones e carne podre. Ela cava pela terra; acerte a cabeça.", need: Boss("mech_worm"), summon: "iron_worm"),
+                (id: "radiante", text: "Junte barras de radiante", hint: "As máquinas soltam. A Bigorna Arcana faz as ferramentas e armaduras radiantes.", need: Item(["radiant_ingot"])),
+                (id: "picareta_verdita", text: "Tenha uma picareta que corte verdita", hint: "Adamantita, titânio ou radiante: a verdita que cresce na selva depois das máquinas só sai com uma delas.", need: Item(["adamantite_pickaxe", "titanium_pickaxe", "radiant_pickaxe", "adamantite_drill", "pickaxe_axe"])),
+                (id: "mecanica", text: "Atraia a mecânica", hint: "Ela está presa na masmorra até o Rei dos Ossos cair. Fale com ela lá.", need: Npc("npc_mechanic"), optional: true),
+            ],
+        ),
+        (
+            id: "selva",
+            era: 4,
+            title: "A selva desperta",
+            intro: "Com as almas das três máquinas, uma flor gigante pode desabrochar na selva. Depois dela, o templo escamado abre o seu altar.",
+            outro: "A Rainha e o Ídolo caíram. Lá no céu, alguém percebeu. Prepare-se para o fim.",
+            reward: [("life_fruit", 3), ("greater_healing_potion", 5)],
+            ready: (48.0, 25),
+            goals: [
+                (id: "rainha_vinhas", text: "Derrote a Rainha das Vinhas", hint: "Bulbo da Rainha: as três almas, uma muda e folhas da selva. Use na selva.", need: Boss("vine_queen"), summon: "queen_bulb", find: Biome(["*Jungle*", "Mata Atlântica"]), said: "A verdita já brota na lama da selva funda. E os espíritos da masmorra ficaram mais fortes."),
+                (id: "verdita", text: "Funda verdita", hint: "Cresce na selva funda depois das máquinas e da Rainha.", need: Item(["verdite_ingot", "raw_verdite"]), find: Biome(["*Jungle*", "Mata Atlântica"])),
+                (id: "idolo_escamado", text: "Derrote o Ídolo Escamado", hint: "O Núcleo do Ídolo vai no Altar Escamado, dentro do Templo Escamado, embaixo da selva.", need: Boss("scale_idol"), summon: "idol_core", find: Structure(["templo_escamado"])),
+                (id: "duque", text: "Derrote o Duque das Marés", hint: "Isca das Marés: cogumelos brilhantes e um olho de aranha. Jogue no mar ou na praia.", need: Boss("tide_duke"), summon: "tide_bait", optional: true, find: Biome(["*Ocean*", "Beach"])),
+                (id: "imperatriz", text: "Derrote a Imperatriz Prismática", hint: "Lâmpada Prismática: almas de luz em volta de pedra luminosa. À noite, no Prisma. De dia ela fica furiosa!", need: Boss("prism_empress"), summon: "prism_lamp", optional: true, find: Land("prism")),
+            ],
+        ),
+        // ---------------------------------------------------------------- Era 5: Fim de jogo
+        (
+            id: "lenda",
+            era: 5,
+            title: "A lenda",
+            intro: "Depois do Ídolo, a Tábua Lunar chama o Profeta. Quando ele cair, quatro pilares celestes se erguem. Derrube os quatro e o último chefe desce.",
+            outro: "Você é a lenda deste mundo. Tudo aqui conta a sua história. Obrigado por me deixar acompanhar!",
+            reward: [("life_fruit", 5)],
+            money: 100000,
+            ready: (50.0, 28),
+            goals: [
+                (id: "profeta", text: "Derrote o Profeta Lunar", hint: "Tábua Lunar: cascas de besouro em volta de um olho de ender. Use na superfície.", need: Boss("lunar_prophet"), summon: "lunar_tablet"),
+                (id: "pilares", text: "Derrube os quatro pilares", hint: "Solar, Vórtice, Nebulosa e Pó Estelar. Os monstros de cada pilar baixam o escudo dele.", need: Bosses(["pillar_solar", "pillar_vortex", "pillar_nebula", "pillar_stardust"], 4)),
+                (id: "final", text: "Derrote o Arauto Celeste", hint: "Ele desce quando os pilares caem, ou com o Selo Celeste (os quatro fragmentos).", need: Boss("celestial_herald"), summon: "celestial_sigil"),
+                (id: "lumita", text: "Forje lumita", hint: "Só o Arauto Celeste deixa cair. A Bigorna Titânica faz o equipamento final.", need: Item(["lumite_ingot"])),
+                (id: "asas", text: "Voe com asas", hint: "Asas são o acessório final de movimento.", need: Item(["*_wings"]), optional: true),
+            ],
+        ),
+        // ---------------------------------------------------------------- Caminhos paralelos
+        (
+            id: "vila",
+            era: 0,
+            side: true,
+            title: "A vila cresce",
+            intro: "Cada casa livre é um convite. Cada morador vem por um motivo: mostre a ele o que ele gosta.",
+            outro: "Uma vila de verdade! Com tanta gente, até um cobrador de impostos vai querer aparecer.",
+            reward: [("red_bed", 1)],
+            money: 5000,
+            goals: [
+                (id: "tres", text: "Tenha 3 moradores", hint: "Construa casas: porta, luz, mesa e cadeira, num cômodo fechado.", need: Town(3)),
+                (id: "guarda", text: "Atraia um guarda", hint: "Ele vem quando duas pessoas já moram aqui.", need: Npc("npc_guard")),
+                (id: "pescador", text: "Atraia o pescador", hint: "Ande com um peixe e tenha uma casa livre.", need: Npc("npc_angler")),
+                (id: "demolidor", text: "Atraia o demolidor", hint: "Ande com uma bomba ou dinamite.", need: Npc("npc_demolitionist")),
+                (id: "armeiro", text: "Atraia o armeiro", hint: "Ande com uma arma de fogo ou munição. O meteorito faz armas.", need: Npc("npc_arms_dealer")),
+                (id: "dez", text: "Tenha 10 moradores", hint: "Cada morador novo pede uma casa livre.", need: Town(10)),
+            ],
+        ),
+        (
+            id: "oficios",
+            era: 0,
+            side: true,
+            title: "Ofícios",
+            intro: "Tudo o que você faz ensina: minerar, cortar, plantar, pescar, lutar, preparar poções e explorar. Aperte Y para ver os seus ofícios.",
+            outro: "Mestre de um ofício! Cada nível deixa esse trabalho mais rápido e rende mais.",
+            reward: [("experience_bottle", 8)],
+            goals: [
+                (id: "nivel5", text: "Chegue ao nível 5 num ofício", hint: "Faça bastante uma coisa só. Y mostra o que cada nível dá.", need: Skill(5)),
+                (id: "nivel10", text: "Chegue ao nível 10 num ofício", hint: "Os ofícios sobem mais devagar no alto.", need: Skill(10)),
+                (id: "nivel20", text: "Chegue ao nível 20 num ofício", hint: "O nível mais alto.", need: Skill(20)),
+            ],
+        ),
+        (
+            id: "eventos",
+            era: 2,
+            side: true,
+            title: "Eventos e invasões",
+            intro: "Às vezes o mundo vem até você: luas de sangue, goblins, piratas. Muitas invasões também se chamam com um item.",
+            outro: "Você segurou todas as invasões. A vila dorme tranquila graças a você.",
+            reward: [("greater_healing_potion", 5)],
+            money: 20000,
+            goals: [
+                (id: "lua_sangue", text: "Sobreviva a uma lua de sangue", hint: "Algumas noites ficam vermelhas, ou use uma Lágrima Sangrenta. Derrote 10 zumbis de sangue.", need: Kill("blood_zombie", 10)),
+                (id: "goblins", text: "Vença a invasão goblin", hint: "Um Estandarte de Batalha Goblin chama a invasão. Depois dela, o funileiro goblin vem morar aqui.", need: Npc("npc_tinkerer")),
+                (id: "piratas", text: "Derrote o Capitão Pirata", hint: "Um Mapa Pirata chama os saqueadores do mar. Depois do Quebra-Mundos.", need: Boss("pirate_captain"), optional: true),
+                (id: "abobora", text: "Derrote o Rei Abóbora", hint: "Medalhão de Abóbora à noite: a Lua da Colheita. Ele vem na quarta onda.", need: Boss("pumpkin_king"), summon: "pumpkin_medallion", optional: true),
+                (id: "gelo", text: "Derrote a Rainha do Gelo", hint: "Medalhão de Gelo à noite: a Lua do Inverno.", need: Boss("ice_queen"), summon: "frost_medallion", optional: true),
+                (id: "cristal", text: "Defenda o Cristal Etéreo", hint: "Ponha o Cristal Etéreo no chão e aguente cinco ondas. O Mago Sombrio vem no fim.", need: Boss("dark_mage"), optional: true),
+                (id: "disco", text: "Derrube o disco voador", hint: "Uma sonda que foge chama os visitantes das estrelas. Derrube a sonda ou enfrente o disco.", need: Boss("saucer"), optional: true),
+            ],
+        ),
+        (
+            id: "outros_mundos",
+            era: 2,
+            side: true,
+            title: "Outros mundos",
+            intro: "Há céus e abismos além do Nether e do Fim. Uma moldura de pedra luminosa acesa com água leva ao Aether. Um coração das profundezas abre o Outro Lado.",
+            outro: "Você conhece mais mundos do que qualquer um. Que viagem!",
+            reward: [("diamond", 4)],
+            money: 20000,
+            goals: [
+                (id: "aether", text: "Entre no Aether", hint: "Moldura de pedra luminosa, acesa com um balde de água.", need: Dim("aether")),
+                (id: "deslizador", text: "Derrote o Deslizador", hint: "Na masmorra de bronze do Aether.", need: Boss("slider"), find: Structure(["bronze_dungeon"])),
+                (id: "valquiria", text: "Derrote a Rainha Valquíria", hint: "Na masmorra de prata do Aether. A chave de bronze abre o caminho.", need: Boss("valkyrie_queen"), find: Structure(["silver_dungeon"])),
+                (id: "sol", text: "Derrote o Espírito do Sol", hint: "Na masmorra de ouro. Enquanto ele vive, o Aether nunca anoitece.", need: Boss("sun_spirit"), find: Structure(["gold_dungeon"])),
+                (id: "outro_lado", text: "Entre no Outro Lado", hint: "Moldura de sculk, acesa com um Coração das Profundezas.", need: Dim("otherside"), optional: true),
+                (id: "espreitador", text: "Derrote o Espreitador", hint: "No templo do Outro Lado.", need: Boss("otherside_stalker"), optional: true, find: Structure(["otherside_temple"])),
+                (id: "arquimago", text: "Derrote o Arquimago Corrompido", hint: "Ouro, tinta arcana e um cristal de mana fazem o Selo Corrompido. A tinta fica nas torres arcanas.", need: Boss("archmage"), summon: "corrupted_seal", optional: true, find: Structure(["torre_arcana", "torre_arcana_nevada"])),
+            ],
+        ),
+    ],
+)
